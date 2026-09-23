@@ -80,6 +80,32 @@ never touched. That's the whole design: **the math decides, not you.**
 
 ---
 
+## Set up a new machine
+
+One command, for a machine that should pick up knowledge you already have elsewhere:
+
+```bash
+git clone https://github.com/samuelmanalu/jejak.git ~/dev/jejak
+cd ~/dev/jejak
+./setup-machine.sh
+```
+
+It checks prerequisites, stores a GitHub credential, collects this machine's own database
+passwords, verifies Neo4j and MySQL are reachable *before* doing any work, installs
+everything, connects to your private knowledge repo, pulls, verifies checksums and starts
+the sync daemon. Idempotent — re-run it if a step fails.
+
+Non-interactive, for a scripted build:
+
+```bash
+JEJAK_KNOWLEDGE_REPO=https://github.com/you/jejak-knowledge.git \
+JEJAK_COMMIT_EMAIL=you@example.com \
+JEJAK_INTERVAL=900 ./setup-machine.sh
+```
+
+Knowledge syncs; prompt history does not — that machine's `/recap` starts empty. Move a
+`backup` tarball if you want the whole history.
+
 ## Install
 
 **Requirements:** Python 3.9+, [Neo4j](https://neo4j.com/download/) 5.x, MySQL 8.x, Claude Code.
