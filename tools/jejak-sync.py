@@ -800,8 +800,10 @@ def cmd_push(args):
         return
     if status.stdout.strip():
         changed = len(status.stdout.strip().splitlines())
-        git(["commit", "-q", "-m",
-             f"knowledge: {len(records)} memories from {jejak.machine_name()}"], repo, quiet=True)
+        subject = os.environ.get("JEJAK_COMMIT_SUBJECT") or \
+            f"knowledge: {len(records)} memories from {jejak.machine_name()}"
+        git(["commit", "-q", "-m", subject,
+             "-m", f"{len(records)} memories from {jejak.machine_name()}"], repo, quiet=True)
         print(f"    {changed} shard file(s) changed")
         unpushed += 1
     if unpushed:
@@ -1006,6 +1008,113 @@ def cmd_sync(args):
                                 allow_unverified=args.allow_unverified))
 
 
+
+# --------------------------------------------------------------------------
+# daemon: periodic background sync
+# --------------------------------------------------------------------------
+
+DAEMON_CFG = os.path.join(CLAUDE_HOME, "hooks", "jejak-daemon.json")
+PLIST_LABEL = "tech.jejak.sync"
+PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{PLIST_LABEL}.plist")
+
+PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python}</string>
+    <string>{script}</string>
+  </array>
+  <key>StartInterval</key><integer>{interval}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{path}</string></dict>
+</dict>
+</plist>
+"""
+
+
+def cmd_daemon(args):
+    import shutil
+    import subprocess
+    daemon_script = os.path.join(CLAUDE_HOME, "hooks", "jejak-daemon.py")
+    log = os.path.join(CLAUDE_HOME, "logs", "jejak-daemon.log")
+
+    if args.action == "install":
+        if not os.path.exists(daemon_script):
+            raise SystemExit(f"  {daemon_script} not found - run ./install.sh first")
+        remote_config()  # fails loudly if no remote is configured
+        interval = max(60, args.interval)
+        cfg = {"interval_seconds": interval,
+               "model": args.model,
+               "summarize": not args.no_summarize,
+               "max_summary_items": 25}
+        json.dump(cfg, open(DAEMON_CFG, "w"), indent=2)
+
+        if sys.platform != "darwin":
+            print(f"  Config written to {DAEMON_CFG}.")
+            print(f"  launchd is macOS-only; schedule it yourself, e.g. crontab:")
+            print(f"    */{max(1, interval // 60)} * * * * python3 {daemon_script}")
+            return
+
+        os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        claude_dir = os.path.dirname(shutil.which("claude") or "")
+        path = ":".join(x for x in [claude_dir, "/usr/local/bin", "/usr/bin", "/bin",
+                                    "/usr/sbin", "/sbin"] if x)
+        open(PLIST_PATH, "w").write(PLIST.format(
+            label=PLIST_LABEL, python=sys.executable, script=daemon_script,
+            interval=interval, log=log, path=path))
+        subprocess.run(["launchctl", "unload", PLIST_PATH],
+                       capture_output=True, text=True)
+        r = subprocess.run(["launchctl", "load", PLIST_PATH],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"  launchctl load failed: {r.stderr.strip()}")
+        print(f"  Daemon installed: every {interval}s ({interval//60} min)")
+        print(f"    summariser : {'off' if args.no_summarize else args.model}")
+        print(f"    plist      : {PLIST_PATH}")
+        print(f"    log        : {log}")
+        print(f"\n  It only commits when there is new knowledge; an idle tick is silent.")
+
+    elif args.action == "uninstall":
+        if sys.platform == "darwin" and os.path.exists(PLIST_PATH):
+            subprocess.run(["launchctl", "unload", PLIST_PATH],
+                           capture_output=True, text=True)
+            os.remove(PLIST_PATH)
+            print("  Daemon removed.")
+        else:
+            print("  No launchd job installed.")
+
+    elif args.action == "status":
+        cfg = json.load(open(DAEMON_CFG)) if os.path.exists(DAEMON_CFG) else None
+        print(f"  config    : {cfg or '(none)'}")
+        if sys.platform == "darwin":
+            r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+            row = [l for l in r.stdout.splitlines() if PLIST_LABEL in l]
+            print(f"  launchd   : {row[0] if row else 'not loaded'}")
+        print(f"  plist     : {PLIST_PATH if os.path.exists(PLIST_PATH) else '(none)'}")
+        try:
+            print(f"  unsynced  : ", end="")
+            sys.path.insert(0, os.path.join(CLAUDE_HOME, "hooks"))
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("jd", daemon_script)
+            jd = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(jd)
+            items, _ = jd.unsynced()
+            print(f"{len(items)} memory(ies)")
+        except Exception as e:
+            print(f"(could not check: {e})")
+
+    elif args.action == "run":
+        r = subprocess.run([sys.executable, daemon_script, "--verbose"])
+        sys.exit(r.returncode)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Move Jejak knowledge between machines")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1061,6 +1170,15 @@ def main():
     fg.add_argument("--no-push", action="store_true")
     fg.add_argument("--allow-unverified", action="store_true")
     fg.set_defaults(func=cmd_forget)
+
+    dm = sub.add_parser("daemon", help="Periodic background sync (install/uninstall/status/run)")
+    dm.add_argument("action", choices=["install", "uninstall", "status", "run"])
+    dm.add_argument("--interval", type=int, default=900,
+                    help="Seconds between checks (default 900 = 15 min, minimum 60)")
+    dm.add_argument("--model", default="haiku", help="Model for commit summaries")
+    dm.add_argument("--no-summarize", action="store_true",
+                    help="Skip the model; use a deterministic commit message")
+    dm.set_defaults(func=cmd_daemon)
 
     vf = sub.add_parser("verify", help="Check the knowledge repo against its checksums")
     vf.set_defaults(func=cmd_verify)

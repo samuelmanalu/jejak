@@ -275,6 +275,41 @@ knowledge change. It is now treated as local telemetry and never leaves the mach
 Conflicts, if two machines really do edit the same entry, resolve the same way as any
 import: newest `updated_at` wins, and `superseded` stays monotonic.
 
+#### Syncing on a timer
+
+`SessionEnd` only fires when a session ends cleanly. For knowledge to reach the repo
+regardless, install the daemon:
+
+```bash
+python3 tools/jejak-sync.py daemon install --interval 900   # every 15 min
+python3 tools/jejak-sync.py daemon status
+python3 tools/jejak-sync.py daemon run                      # one-shot, verbose
+python3 tools/jejak-sync.py daemon uninstall
+```
+
+On macOS this writes a launchd agent (`tech.jejak.sync`), so it survives logout and reboot.
+Elsewhere it writes the config and prints the crontab line to use. The interval lives in
+`~/.claude/hooks/jejak-daemon.json` and the minimum is 60s.
+
+**Detection is deterministic; the model only writes the message.** Whether knowledge is
+unsynced is a set difference between the graph and the repo — a fact, not a judgement — so
+no model sits in that path. An idle tick costs ~0.4s, makes no commit and calls nothing.
+
+When there *is* new knowledge, Haiku (via the same `claude -p` path the extractor uses)
+turns the commit subject into something you can read months later:
+
+```
+Jejak daemon: launchd scheduling and deterministic sync detection
+Jejak sync: untested paths, autosync, hook caching
+```
+
+instead of `knowledge: 2380 memories from MMI0122312`. If the model is slow, unavailable or
+returns nonsense, the sync still happens with a deterministic subject
+(`knowledge: 3 learnings, 1 decision`) — `--no-summarize` skips it entirely.
+
+A lockfile stops overlapping runs from fighting over the git index, and a lock older than
+30 minutes is treated as stale, so a killed run never wedges the daemon permanently.
+
 #### Deleting knowledge
 
 Import only ever merges, so deleting a memory locally is not enough — another machine still
