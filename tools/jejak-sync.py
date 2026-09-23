@@ -554,6 +554,18 @@ def assert_private(url):
                                    text=True).stdout.strip() or None
         except FileNotFoundError:
             token = None
+    if not token:
+        # Unattended path (the SessionEnd autosync hook has no env token):
+        # ask git for the very credential it already uses to push. Nothing new
+        # is stored, and the gate keeps verifying live rather than on trust.
+        try:
+            r = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=github.com\n\n",
+                               capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                if line.startswith("password="):
+                    token = line.split("=", 1)[1].strip() or None
+        except Exception:
+            token = None
     req = urllib.request.Request(f"https://api.github.com/repos/{owner}/{repo}",
                                  headers={"Accept": "application/vnd.github+json"})
     if token:
@@ -577,6 +589,15 @@ def shard_for(memory_id):
     return (memory_id[:SHARD_WIDTH] or "00").lower()
 
 
+def shard_digest(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def write_shards(repo, records):
     """Deterministic layout: sorted records, sorted keys, one shard per
     memory_id prefix. A new memory touches one small file, so git diffs stay
@@ -594,21 +615,42 @@ def write_shards(repo, records):
         with open(os.path.join(kdir, f"{shard}.jsonl"), "w") as fh:
             for r in recs:
                 fh.write(json.dumps(r, sort_keys=True) + "\n")
+    kdir_files = sorted(f for f in os.listdir(kdir) if f.endswith(".jsonl"))
     json.dump({"format_version": FORMAT_VERSION, "shard_width": SHARD_WIDTH,
-               "memory_count": len(records)},
+               "memory_count": len(records),
+               "shards": {f: {"sha256": shard_digest(os.path.join(kdir, f)),
+                              "records": sum(1 for l in open(os.path.join(kdir, f)) if l.strip())}
+                          for f in kdir_files}},
               open(os.path.join(repo, "manifest.json"), "w"), indent=2, sort_keys=True)
     return len(buckets)
 
 
-def read_shards(repo):
+def read_shards(repo, strict=True):
+    """Read every shard. A corrupt line is named, not tracebacked, and in
+    strict mode it stops the run - a backup that silently drops records is
+    worse than one that refuses to load."""
     kdir = os.path.join(repo, "knowledge")
     if not os.path.isdir(kdir):
         return []
-    out = []
+    out, bad = [], []
     for name in sorted(os.listdir(kdir)):
-        if name.endswith(".jsonl"):
-            with open(os.path.join(kdir, name)) as fh:
-                out.extend(json.loads(l) for l in fh if l.strip())
+        if not name.endswith(".jsonl"):
+            continue
+        with open(os.path.join(kdir, name)) as fh:
+            for lineno, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    bad.append(f"knowledge/{name}:{lineno}: {e.msg}")
+    if bad:
+        msg = "Corrupt shard data:\n    " + "\n    ".join(bad[:10])
+        if len(bad) > 10:
+            msg += f"\n    ... and {len(bad)-10} more"
+        if strict:
+            raise SystemExit(msg + "\n\n  Run: jejak-sync verify   (then restore from git history)")
+        print("    ! " + msg)
     return out
 
 
@@ -678,9 +720,39 @@ def cmd_push(args):
     if args.no_push:
         print("    --no-push: committed locally only")
         return
+
+    # A plain push fails the moment another machine has pushed, which would
+    # leave this machine's knowledge committed locally and never stored.
+    # Converge and retry instead.
     print("==> Pushing")
-    git(["push", "-q", "origin", "HEAD"], repo, quiet=True)
-    print("    pushed")
+    import subprocess
+    for attempt in range(1, 4):
+        r = subprocess.run(["git", "push", "origin", "HEAD:main"],
+                           cwd=repo, capture_output=True, text=True)
+        if r.returncode == 0:
+            print("    pushed")
+            return
+        if "rejected" not in r.stderr and "fetch first" not in r.stderr:
+            raise SystemExit(f"    push failed:\n{r.stderr.strip()}")
+        print(f"    remote moved; merging and retrying ({attempt}/3)")
+        git(["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"], repo, check=False, quiet=True)
+        # A conflicted shard is resolved by re-deriving it: the local graph
+        # already merged the remote records on pull, so ours is the superset.
+        st = git(["diff", "--name-only", "--diff-filter=U"], repo, quiet=True)
+        if st.stdout.strip():
+            conflicted = st.stdout.strip().splitlines()
+            print(f"    resolving {len(conflicted)} conflicted shard(s) from the merged graph")
+            merged = read_shards(repo, strict=False)
+            by_id = {}
+            for rec in merged:
+                mid = rec["props"]["memory_id"]
+                prev = by_id.get(mid)
+                if prev is None or str(rec["props"].get("updated_at") or "") > str(prev["props"].get("updated_at") or ""):
+                    by_id[mid] = rec
+            write_shards(repo, list(by_id.values()))
+            git(["add", "-A"], repo, quiet=True)
+            git(["commit", "-q", "--no-edit", "-m", "merge: reconcile shards"], repo, check=False, quiet=True)
+    raise SystemExit("    push still rejected after 3 attempts - resolve by hand in " + repo)
 
 
 def cmd_pull(args):
@@ -703,6 +775,55 @@ def cmd_pull(args):
             for r in records:
                 fh.write(json.dumps(r) + "\n")
         cmd_import(argparse.Namespace(file=bundle, dry_run=args.dry_run))
+
+
+def cmd_verify(args):
+    """Is the repo trustworthy as a store? Checks the manifest against what is
+    actually on disk, so silent truncation or tampering is caught."""
+    cfg = remote_config()
+    repo = cfg["path"]
+    kdir = os.path.join(repo, "knowledge")
+    mpath = os.path.join(repo, "manifest.json")
+    problems = []
+
+    if not os.path.exists(mpath):
+        raise SystemExit(f"  no manifest.json in {repo} - push once to create it")
+    manifest = json.load(open(mpath))
+    recorded = manifest.get("shards")
+    if not recorded:
+        print("  manifest has no checksums (written by an older version)")
+        print("  run: jejak-sync push   to upgrade it")
+        return
+
+    on_disk = sorted(f for f in os.listdir(kdir) if f.endswith(".jsonl")) if os.path.isdir(kdir) else []
+    for name in sorted(set(recorded) | set(on_disk)):
+        if name not in on_disk:
+            problems.append(f"MISSING  {name}")
+            continue
+        if name not in recorded:
+            problems.append(f"UNTRACKED {name}")
+            continue
+        path = os.path.join(kdir, name)
+        if shard_digest(path) != recorded[name]["sha256"]:
+            got = sum(1 for l in open(path) if l.strip())
+            problems.append(f"CHANGED  {name}  (manifest {recorded[name]['records']} records, file has {got})")
+
+    records = read_shards(repo, strict=False)
+    ids = [r["props"]["memory_id"] for r in records]
+    dupes = len(ids) - len(set(ids))
+
+    print(f"  shards        : {len(on_disk)}")
+    print(f"  records       : {len(records)}  (manifest says {manifest.get('memory_count')})")
+    print(f"  duplicate ids : {dupes}")
+    if problems:
+        print(f"\n  {len(problems)} PROBLEM(S):")
+        for p in problems[:20]:
+            print(f"    {p}")
+        print("\n  A checksum mismatch after your own push is normal (push rewrites the")
+        print("  manifest). A mismatch you did not cause means the file changed under you:")
+        print(f"    git -C {repo} status && git -C {repo} checkout -- knowledge/")
+        raise SystemExit(1)
+    print("\n  OK - every shard matches its checksum.")
 
 
 def cmd_sync(args):
@@ -760,6 +881,9 @@ def main():
     sy = sub.add_parser("sync", help="pull then push - converge with the remote")
     sy.add_argument("--allow-unverified", action="store_true")
     sy.set_defaults(func=cmd_sync)
+
+    vf = sub.add_parser("verify", help="Check the knowledge repo against its checksums")
+    vf.set_defaults(func=cmd_verify)
 
     n = sub.add_parser("inspect", help="Describe a bundle without importing it")
     n.add_argument("file")

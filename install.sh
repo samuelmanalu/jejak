@@ -26,6 +26,9 @@ python3 -m pip install --quiet --upgrade -r "$SRC/requirements.txt"
 # --- 2. code --------------------------------------------------------------
 mkdir -p "$DEST/hooks" "$DEST/skills/jejak" "$DEST/skills/recap" "$DEST/logs"
 cp "$SRC"/hooks/*.py "$SRC"/hooks/*.html "$DEST/hooks/"
+# jejak-sync lives beside the hooks once installed, so the SessionEnd
+# autosync hook can find it without knowing where the checkout is.
+cp "$SRC"/tools/jejak-sync.py "$DEST/hooks/"
 cp "$SRC"/skills/jejak/SKILL.md "$DEST/skills/jejak/"
 cp "$SRC"/skills/recap/SKILL.md "$DEST/skills/recap/"
 echo "==> Copied hooks and skills"

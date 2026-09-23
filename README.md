@@ -275,6 +275,43 @@ knowledge change. It is now treated as local telemetry and never leaves the mach
 Conflicts, if two machines really do edit the same entry, resolve the same way as any
 import: newest `updated_at` wins, and `superseded` stays monotonic.
 
+#### Making the repo dependable
+
+A sync tool you have to remember to run, that fails when another machine got there first,
+and that cannot tell you whether the stored data is intact, is not storage. Four properties
+close that gap.
+
+**1. It runs itself.** A `SessionEnd` hook (`jejak-autosync.py`) pushes when a session ends.
+Detached, so it never delays exit; a no-op unless a remote is configured; failures are logged,
+never raised, because a missed push is recoverable and a blocked session is not.
+
+**2. Push converges instead of failing.** A plain `git push` is rejected the moment another
+machine has pushed — leaving your knowledge committed locally and never stored. `push` now
+merges and retries (3 attempts). If a shard conflicts, it is re-derived from the merged graph
+rather than hand-resolved, because after the pull the local graph is already the superset.
+
+**3. Integrity is checkable.** The manifest carries a SHA-256 and record count per shard:
+
+```bash
+python3 tools/jejak-sync.py verify
+```
+```
+  shards        : 256
+  records       : 2361  (manifest says 2361)
+  duplicate ids : 0
+
+  OK - every shard matches its checksum.
+```
+
+This catches the failure that matters most — a shard truncated at a *record boundary* is
+still valid JSON, so it would load fine while silently having lost knowledge. `verify`
+reports it as `CHANGED 05.jsonl (manifest 11 records, file has 2)`. Recovery is
+`git checkout -- knowledge/`, because every version is in git history.
+
+**4. Corruption is diagnosed, not tracebacked.** A malformed line is reported as
+`knowledge/07.jsonl:14: Unterminated string`, and in strict mode it *stops* the run — a
+store that silently drops records is worse than one that refuses to load.
+
 #### The private-repo gate
 
 ```
@@ -285,6 +322,12 @@ Your graph contains employer-internal detail. Make the repo private:
 
 It also refuses when it *cannot verify* — a 404, or no token available — rather than
 failing open. Override with `--allow-unverified` only for a non-GitHub remote you trust.
+
+Failing closed nearly broke the automation: the `SessionEnd` hook has no `GITHUB_TOKEN` in
+its environment, so the gate refused every unattended push. Rather than weaken it to trust a
+verification recorded at setup time, the gate now asks `git credential fill` for the very
+credential git already uses to push. Nothing new is stored, and every push — attended or
+not — is still verified live against the API.
 
 > Measured on a real working graph: **42% of non-prompt memories contained
 > employer-internal detail** — service names, production config, ticket and MR numbers.
