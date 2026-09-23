@@ -6,6 +6,20 @@ Jejak sync — move knowledge between machines.
     jejak-sync import FILE [--dry-run]
     jejak-sync inspect FILE
 
+    jejak-sync backup  [-o FILE]          full snapshot: moving laptops
+    jejak-sync restore FILE [--dry-run]
+
+Two modes, deliberately separate:
+
+  export/import  — knowledge only, for syncing two machines you both use.
+                   Prompts excluded, small, merge-oriented.
+  backup/restore — everything: all memories INCLUDING prompts, the MySQL
+                   prompt log, and your Jejak config. For moving to a new
+                   laptop or keeping a real backup. Restore is still a
+                   merge, so it is safe to run onto a machine in use.
+
+Neither carries db-config.json. Credentials are yours to move by hand.
+
 Design notes, because they matter for correctness:
 
   * memory_id is a UUID and is the merge key. Import is idempotent and
@@ -24,10 +38,13 @@ Design notes, because they matter for correctness:
 """
 import argparse
 import gzip
+import io
 import json
 import os
 import socket
 import sys
+import tarfile
+import tempfile
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
@@ -36,6 +53,8 @@ from neo4j import GraphDatabase  # noqa: E402
 
 FORMAT_VERSION = 1
 HOME = os.path.expanduser("~")
+BEGIN_MARK = "<!-- JEJAK:BEGIN"
+END_MARK = "<!-- JEJAK:END -->"
 
 # Derived locally, never carried between machines.
 DERIVED_PROPS = {"relevance_score", "score_updated_at", "promoted_at", "level"}
@@ -290,6 +309,193 @@ def cmd_import(args):
         drv.close()
 
 
+
+# --------------------------------------------------------------------------
+# backup / restore  (full snapshot, for moving machines)
+# --------------------------------------------------------------------------
+
+CLAUDE_HOME = os.environ.get("CLAUDE_HOME", os.path.expanduser("~/.claude"))
+BACKUP_VERSION = 1
+
+
+def mysql_conn():
+    import mysql.connector
+    cfg = jejak.load_config("mysql")
+    return mysql.connector.connect(host=cfg["host"], user=cfg["user"],
+                                   password=cfg["password"], database=cfg["database"])
+
+
+def dump_prompt_logs(path):
+    """MySQL prompt log -> gzipped JSONL. Drops the auto-increment id (machine
+    specific) and makes cwd portable. Content is redacted again on the way out."""
+    try:
+        conn = mysql_conn()
+    except Exception as e:
+        print(f"    prompt log: skipped ({e})")
+        return 0
+    n = 0
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT session_id, cwd, prompt, tags, machine_name, created_at FROM prompt_logs")
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            for row in cur:
+                row["cwd"] = portable(row["cwd"] or "")
+                row["prompt"] = jejak.redact(row["prompt"] or "")
+                row["created_at"] = iso(row["created_at"])
+                if not isinstance(row["tags"], str):
+                    row["tags"] = json.dumps(row["tags"])
+                fh.write(json.dumps(row) + "\n")
+                n += 1
+        cur.close()
+    finally:
+        conn.close()
+    return n
+
+
+def load_prompt_logs(path, dry_run=False):
+    """Merge prompt-log rows back in, keyed on (machine_name, session_id,
+    created_at) so re-running a restore never duplicates."""
+    if not os.path.exists(path):
+        return 0, 0
+    rows = [json.loads(l) for l in gzip.open(path, "rt", encoding="utf-8")]
+    try:
+        conn = mysql_conn()
+    except Exception as e:
+        print(f"    prompt log: skipped ({e})")
+        return 0, 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT machine_name, session_id, created_at FROM prompt_logs")
+        have = {(m, s, iso(c)) for m, s, c in cur.fetchall()}
+        todo = [r for r in rows
+                if (r["machine_name"], r["session_id"], r["created_at"]) not in have]
+        if dry_run or not todo:
+            cur.close()
+            return len(todo), len(rows) - len(todo)
+        cur.executemany(
+            "INSERT INTO prompt_logs (session_id, cwd, prompt, tags, machine_name, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            [(r["session_id"], localize(r["cwd"]), r["prompt"], r["tags"],
+              r["machine_name"], r["created_at"].replace("T", " ")[:19]) for r in todo])
+        conn.commit()
+        cur.close()
+        return len(todo), len(rows) - len(todo)
+    finally:
+        conn.close()
+
+
+def cmd_backup(args):
+    out = args.output or f"jejak-backup-{socket.gethostname()}-{datetime.now():%Y%m%d-%H%M%S}.tar.gz"
+    out = os.path.abspath(out)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        graph = os.path.join(tmp, "graph.jsonl.gz")
+        print("==> Knowledge graph (all memories, prompts included)")
+        cmd_export(argparse.Namespace(output=graph, include_prompts=True,
+                                      since=None, project=None))
+
+        print("==> Prompt log")
+        plog = os.path.join(tmp, "prompt_logs.jsonl.gz")
+        n_logs = dump_prompt_logs(plog)
+        print(f"    {n_logs} rows")
+
+        print("==> Config")
+        cfgdir = os.path.join(tmp, "config")
+        os.makedirs(cfgdir)
+        kept = []
+        md = os.path.join(CLAUDE_HOME, "CLAUDE.md")
+        if os.path.exists(md):
+            text = open(md).read()
+            if BEGIN_MARK in text and END_MARK in text:
+                block = text[text.index(BEGIN_MARK):text.index(END_MARK) + len(END_MARK)]
+                open(os.path.join(cfgdir, "CLAUDE.md.jejak-block.md"), "w").write(block)
+                kept.append("CLAUDE.md Jejak block")
+        st = os.path.join(CLAUDE_HOME, "settings.json")
+        if os.path.exists(st):
+            try:
+                hooks = json.load(open(st)).get("hooks", {})
+                jejak_hooks = {}
+                for ev, groups in hooks.items():
+                    keep = []
+                    for g in groups:
+                        hs = [h for h in g.get("hooks", []) if "jejak" in h.get("command", "")
+                              or "prompt-logger" in h.get("command", "")]
+                        if hs:
+                            ng = {"hooks": hs}
+                            if g.get("matcher"):
+                                ng["matcher"] = g["matcher"]
+                            keep.append(ng)
+                    if keep:
+                        jejak_hooks[ev] = keep
+                if jejak_hooks:
+                    json.dump({"hooks": jejak_hooks},
+                              open(os.path.join(cfgdir, "settings.hooks.json"), "w"), indent=2)
+                    kept.append("settings.json hook registrations")
+            except Exception as e:
+                print(f"    settings.json: skipped ({e})")
+        print("    " + (", ".join(kept) if kept else "nothing found"))
+
+        manifest = {
+            "kind": "jejak-backup",
+            "backup_version": BACKUP_VERSION,
+            "source_machine": jejak.machine_name(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "prompt_log_rows": n_logs,
+            "contains_credentials": False,
+            "note": "db-config.json is NOT included - move credentials yourself",
+        }
+        json.dump(manifest, open(os.path.join(tmp, "manifest.json"), "w"), indent=2)
+
+        with tarfile.open(out, "w:gz") as tar:
+            for name in sorted(os.listdir(tmp)):
+                tar.add(os.path.join(tmp, name), arcname=name)
+
+    print(f"\nBackup written: {out}  ({os.path.getsize(out)/1024:.0f} KB)")
+    print("\nOn the new machine:")
+    print("    git clone https://github.com/samuelmanalu/jejak.git && cd jejak && ./install.sh")
+    print("    # edit ~/.claude/hooks/db-config.json, re-run ./install.sh")
+    print(f"    python3 tools/jejak-sync.py restore {os.path.basename(out)}")
+    print("\nThis file is your knowledge in plaintext. Move it like a database dump.")
+
+
+def cmd_restore(args):
+    path = os.path.abspath(args.file)
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(path, "r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.startswith(("/", "..")) or ".." in member.name.split("/"):
+                    raise SystemExit(f"refusing unsafe path in archive: {member.name}")
+            tar.extractall(tmp)
+
+        mpath = os.path.join(tmp, "manifest.json")
+        if not os.path.exists(mpath):
+            raise SystemExit(f"{path}: no manifest.json - not a Jejak backup")
+        manifest = json.load(open(mpath))
+        if manifest.get("backup_version") != BACKUP_VERSION:
+            raise SystemExit(f"backup version {manifest.get('backup_version')}, "
+                             f"this tool speaks {BACKUP_VERSION}")
+        print(f"==> Backup from {manifest['source_machine']} ({manifest['created_at']})")
+
+        graph = os.path.join(tmp, "graph.jsonl.gz")
+        if os.path.exists(graph):
+            cmd_import(argparse.Namespace(file=graph, dry_run=args.dry_run))
+
+        print("\n==> Prompt log")
+        added, skipped = load_prompt_logs(os.path.join(tmp, "prompt_logs.jsonl.gz"),
+                                          dry_run=args.dry_run)
+        verb = "would insert" if args.dry_run else "inserted"
+        print(f"    {verb} {added}, already present {skipped}")
+
+        cfgdir = os.path.join(tmp, "config")
+        if os.path.isdir(cfgdir) and os.listdir(cfgdir):
+            print("\n==> Config in this backup (apply with ./install.sh, not restored automatically):")
+            for f in sorted(os.listdir(cfgdir)):
+                print(f"    {f}")
+
+    if args.dry_run:
+        print("\n--dry-run: nothing written.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Move Jejak knowledge between machines")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -306,6 +512,15 @@ def main():
     i.add_argument("file")
     i.add_argument("--dry-run", action="store_true", help="Report the plan, write nothing")
     i.set_defaults(func=cmd_import)
+
+    b = sub.add_parser("backup", help="Full snapshot: knowledge + prompt log + config")
+    b.add_argument("-o", "--output")
+    b.set_defaults(func=cmd_backup)
+
+    r = sub.add_parser("restore", help="Restore a full backup onto this machine")
+    r.add_argument("file")
+    r.add_argument("--dry-run", action="store_true", help="Report the plan, write nothing")
+    r.set_defaults(func=cmd_restore)
 
     n = sub.add_parser("inspect", help="Describe a bundle without importing it")
     n.add_argument("file")

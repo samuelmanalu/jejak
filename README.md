@@ -200,6 +200,42 @@ python3 tools/jejak-sync.py import  jejak-....jsonl.gz
 
 Run it in both directions and the two machines converge.
 
+### Changing laptops: full backup
+
+`export` carries knowledge only. For a machine move — or a real backup — `backup` takes
+everything: all memories *including* prompts, the MySQL prompt log, and your Jejak config.
+
+```bash
+python3 tools/jejak-sync.py backup
+#   -> jejak-backup-<host>-<timestamp>.tar.gz
+```
+
+```
+manifest.json                      what this is, where it came from
+graph.jsonl.gz                     every memory, prompts included
+prompt_logs.jsonl.gz               the MySQL prompt log
+config/CLAUDE.md.jejak-block.md    your Jejak rules block
+config/settings.hooks.json         your hook registrations
+```
+
+On the new laptop:
+
+```bash
+git clone https://github.com/samuelmanalu/jejak.git && cd jejak && ./install.sh
+# edit ~/.claude/hooks/db-config.json
+./install.sh                                          # schema + wiring
+python3 tools/jejak-sync.py restore jejak-backup-....tar.gz
+```
+
+A whole working setup — 3,788 memories and 1,621 prompt-log rows — packs into under 1 MB.
+
+Restore is a **merge**, not an overwrite, so it is safe to run onto a machine already in
+use: memories dedupe on `memory_id`, prompt-log rows on `(machine_name, session_id,
+created_at)`. `--dry-run` shows the plan first.
+
+**Credentials are never in the backup.** `db-config.json` is excluded by design — move
+your passwords yourself. The manifest records `contains_credentials: false`.
+
 ### What makes this safe
 
 | Concern | How it's handled |
