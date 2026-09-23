@@ -215,6 +215,21 @@ def cmd_import(args):
     manifest, records = read_bundle(args.file)
     print(f"==> Bundle from {manifest['source_machine']} ({len(records)} memories)")
 
+    # Honour tombstones here, not only in pull: a backup taken before a
+    # `forget` still contains the deleted memory, and restoring it would
+    # quietly resurrect knowledge someone deliberately removed.
+    if os.path.exists(REMOTE_CFG):
+        try:
+            tombs = read_tombstones(json.load(open(REMOTE_CFG))["path"])
+        except Exception:
+            tombs = {}
+        if tombs:
+            before = len(records)
+            records = [r for r in records if r["props"]["memory_id"] not in tombs]
+            if before != len(records):
+                print(f"    skipped {before - len(records)} tombstoned memory(ies) "
+                      f"(deleted via `forget`, not resurrected)")
+
     drv = driver()
     try:
         with drv.session() as session:
