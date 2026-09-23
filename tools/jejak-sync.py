@@ -514,6 +514,50 @@ def cmd_restore(args):
 REMOTE_CFG = os.path.join(CLAUDE_HOME, "hooks", "jejak-remote.json")
 DEFAULT_CLONE = os.path.join(CLAUDE_HOME, "jejak-knowledge")
 SHARD_WIDTH = 2  # memory_id[:2] -> 256 shards
+TOMBSTONES = "tombstones.jsonl"
+
+
+def read_tombstones(repo):
+    """id -> tombstone record. Append-only: a deletion recorded anywhere stays
+    recorded, so a machine that has not pulled yet cannot resurrect it."""
+    path = os.path.join(repo, TOMBSTONES)
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    for lineno, line in enumerate(open(path), 1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+            out[rec["memory_id"]] = rec
+        except (json.JSONDecodeError, KeyError) as e:
+            raise SystemExit(f"{TOMBSTONES}:{lineno}: corrupt tombstone ({e})")
+    return out
+
+
+def write_tombstones(repo, tombs):
+    """Deterministic and additive - never truncates another machine's entries."""
+    path = os.path.join(repo, TOMBSTONES)
+    merged = read_tombstones(repo)
+    merged.update(tombs)
+    with open(path, "w") as fh:
+        for mid in sorted(merged):
+            fh.write(json.dumps(merged[mid], sort_keys=True) + "\n")
+    return merged
+
+
+def apply_tombstones(session, tombs):
+    """Remove tombstoned memories from the local graph. Returns how many went."""
+    if not tombs:
+        return 0
+    ids = list(tombs)
+    gone = 0
+    for i in range(0, len(ids), 500):
+        r = session.run("MATCH (m:Memory) WHERE m.memory_id IN $ids "
+                        "WITH m, count(m) AS _ DETACH DELETE m RETURN count(_) AS c",
+                        ids=ids[i:i + 500]).single()
+        gone += (r["c"] if r else 0)
+    return gone
 
 
 def git(args, cwd, check=True, quiet=False):
@@ -702,21 +746,51 @@ def cmd_push(args):
     if not args.allow_unverified:
         assert_private(cfg["url"])
 
+    # Enforce deletions recorded anywhere BEFORE collecting, otherwise this
+    # machine re-adds what another machine deleted and the tombstone is moot.
+    tombs = read_tombstones(repo)
+    if tombs:
+        drv = driver()
+        try:
+            with drv.session() as session:
+                gone = apply_tombstones(session, tombs)
+        finally:
+            drv.close()
+        print(f"==> Tombstones: {len(tombs)} recorded"
+              + (f", removed {gone} still present locally" if gone else ""))
+
     print("==> Collecting knowledge")
     records = fetch_records(include_prompts=args.include_prompts)
+    records = [r for r in records if r["props"]["memory_id"] not in tombs]
     n_shards = write_shards(repo, records)
+    write_tombstones(repo, tombs)
     print(f"    {len(records)} memories across {n_shards} shards")
 
     print("==> Committing")
     git(["add", "-A"], repo, quiet=True)
     status = git(["status", "--porcelain"], repo, quiet=True)
-    if not status.stdout.strip():
+
+    # Commits made elsewhere in this tool (forget, a conflict reconcile) leave a
+    # clean tree with unpushed work. Returning early here once made `forget`
+    # report success while the deletion never left the machine.
+    git(["fetch", "-q", "origin"], repo, check=False, quiet=True)
+    ahead = git(["rev-list", "--count", "origin/main..HEAD"], repo, check=False, quiet=True)
+    try:
+        unpushed = int((ahead.stdout or "0").strip() or 0)
+    except ValueError:
+        unpushed = 0
+
+    if not status.stdout.strip() and unpushed == 0:
         print("    nothing changed")
         return
-    changed = len(status.stdout.strip().splitlines())
-    git(["commit", "-q", "-m",
-         f"knowledge: {len(records)} memories from {jejak.machine_name()}"], repo, quiet=True)
-    print(f"    {changed} shard file(s) changed")
+    if status.stdout.strip():
+        changed = len(status.stdout.strip().splitlines())
+        git(["commit", "-q", "-m",
+             f"knowledge: {len(records)} memories from {jejak.machine_name()}"], repo, quiet=True)
+        print(f"    {changed} shard file(s) changed")
+        unpushed += 1
+    if unpushed:
+        print(f"    {unpushed} commit(s) to push")
     if args.no_push:
         print("    --no-push: committed locally only")
         return
@@ -760,7 +834,30 @@ def cmd_pull(args):
     repo = cfg["path"]
     print("==> Fetching")
     git(["pull", "-q", "--no-rebase", "origin", "main"], repo, check=False, quiet=True)
+    tombs = read_tombstones(repo)
     records = read_shards(repo)
+    if tombs:
+        before = len(records)
+        records = [r for r in records if r["props"]["memory_id"] not in tombs]
+        if args.dry_run:
+            drv = driver()
+            try:
+                with drv.session() as session:
+                    n = session.run("MATCH (m:Memory) WHERE m.memory_id IN $ids "
+                                    "RETURN count(m) AS c", ids=list(tombs)).single()["c"]
+            finally:
+                drv.close()
+            print(f"    tombstones: {len(tombs)} recorded, would delete {n} local memory(ies)")
+        else:
+            drv = driver()
+            try:
+                with drv.session() as session:
+                    gone = apply_tombstones(session, tombs)
+            finally:
+                drv.close()
+            print(f"    tombstones: {len(tombs)} recorded, deleted {gone} local memory(ies)")
+        if before != len(records):
+            print(f"    skipped {before - len(records)} tombstoned record(s) still in shards")
     if not records:
         print("    remote holds no knowledge yet")
         return
@@ -775,6 +872,60 @@ def cmd_pull(args):
             for r in records:
                 fh.write(json.dumps(r) + "\n")
         cmd_import(argparse.Namespace(file=bundle, dry_run=args.dry_run))
+
+
+def cmd_forget(args):
+    """Delete a memory everywhere: locally now, and on every other machine at
+    its next pull. This is the one destructive operation in the tool."""
+    cfg = remote_config()
+    repo = cfg["path"]
+    drv = driver()
+    try:
+        with drv.session() as session:
+            found = []
+            for prefix in args.memory_id:
+                rows = session.run(
+                    "MATCH (m:Memory) WHERE m.memory_id STARTS WITH $p "
+                    "RETURN m.memory_id AS id, m.type AS t, substring(m.content,0,120) AS c",
+                    p=prefix).data()
+                if not rows:
+                    print(f"  no memory matches {prefix}")
+                elif len(rows) > 1 and len(prefix) < 36:
+                    print(f"  {prefix} is ambiguous ({len(rows)} matches) - use a longer id")
+                else:
+                    found.extend(rows)
+            if not found:
+                raise SystemExit("  nothing to forget")
+
+            print(f"\n  About to permanently delete {len(found)} memory(ies):")
+            for r in found:
+                print(f"    [{r['t']}] {r['id'][:8]}  {r['c']}")
+            print("\n  They will be deleted from this machine now, and from every other")
+            print("  machine at its next pull. Content stays recoverable in git history.")
+            if not args.yes:
+                if input("\n  Type 'forget' to confirm: ").strip() != "forget":
+                    raise SystemExit("  aborted")
+
+            now = datetime.now(timezone.utc).isoformat()
+            tombs = {r["id"]: {"memory_id": r["id"], "deleted_at": now,
+                               "machine": jejak.machine_name(),
+                               "type": r["t"],
+                               "reason": args.reason or ""} for r in found}
+            gone = apply_tombstones(session, tombs)
+    finally:
+        drv.close()
+
+    all_tombs = write_tombstones(repo, tombs)
+    records = [r for r in read_shards(repo, strict=False)
+               if r["props"]["memory_id"] not in all_tombs]
+    write_shards(repo, records)
+    print(f"\n  deleted {gone} locally; {len(all_tombs)} tombstone(s) recorded")
+    git(["add", "-A"], repo, quiet=True)
+    git(["commit", "-q", "-m", f"forget {len(tombs)} memory(ies) from {jejak.machine_name()}"],
+        repo, check=False, quiet=True)
+    if not args.no_push:
+        cmd_push(argparse.Namespace(include_prompts=False, no_push=False,
+                                    allow_unverified=args.allow_unverified))
 
 
 def cmd_verify(args):
@@ -812,7 +963,13 @@ def cmd_verify(args):
     ids = [r["props"]["memory_id"] for r in records]
     dupes = len(ids) - len(set(ids))
 
+    tombs = read_tombstones(repo)
+    leaked = [r["props"]["memory_id"] for r in records
+              if r["props"]["memory_id"] in tombs]
+    if leaked:
+        problems.append(f"RESURRECTED {len(leaked)} tombstoned memory(ies) present in shards")
     print(f"  shards        : {len(on_disk)}")
+    print(f"  tombstones    : {len(tombs)}")
     print(f"  records       : {len(records)}  (manifest says {manifest.get('memory_count')})")
     print(f"  duplicate ids : {dupes}")
     if problems:
@@ -881,6 +1038,14 @@ def main():
     sy = sub.add_parser("sync", help="pull then push - converge with the remote")
     sy.add_argument("--allow-unverified", action="store_true")
     sy.set_defaults(func=cmd_sync)
+
+    fg = sub.add_parser("forget", help="Delete memories everywhere (records a tombstone)")
+    fg.add_argument("memory_id", nargs="+", help="Memory id or unique prefix")
+    fg.add_argument("--reason", help="Why, for the audit trail")
+    fg.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    fg.add_argument("--no-push", action="store_true")
+    fg.add_argument("--allow-unverified", action="store_true")
+    fg.set_defaults(func=cmd_forget)
 
     vf = sub.add_parser("verify", help="Check the knowledge repo against its checksums")
     vf.set_defaults(func=cmd_verify)

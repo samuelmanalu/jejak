@@ -275,6 +275,33 @@ knowledge change. It is now treated as local telemetry and never leaves the mach
 Conflicts, if two machines really do edit the same entry, resolve the same way as any
 import: newest `updated_at` wins, and `superseded` stays monotonic.
 
+#### Deleting knowledge
+
+Import only ever merges, so deleting a memory locally is not enough — another machine still
+holding it pushes it straight back. Deletion therefore needs a tombstone:
+
+```bash
+python3 tools/jejak-sync.py forget 44925a40 --reason "was wrong about the pool size"
+```
+
+It shows what will go, asks for confirmation (`--yes` to skip), deletes locally, records the
+tombstone, strips the record from the shards, and pushes. Every other machine deletes it at
+its next `pull`, even one that never saw the original delete.
+
+```
+tombstones.jsonl
+{"deleted_at":"...","machine":"...","memory_id":"...","reason":"...","type":"finding"}
+```
+
+Tombstones are append-only and additive — writing them never truncates another machine's
+entries — and `push` applies them *before* collecting knowledge, so a machine that has not
+pulled yet cannot re-add what someone else deleted. `verify` reports the count and flags any
+tombstoned id that reappears in a shard as `RESURRECTED`.
+
+Most of the time you want `--supersedes` instead: it corrects an entry while keeping the
+history. Reserve `forget` for knowledge that should not exist at all. The content stays
+recoverable from git history either way.
+
 #### Making the repo dependable
 
 A sync tool you have to remember to run, that fails when another machine got there first,
