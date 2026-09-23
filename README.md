@@ -180,6 +180,48 @@ short end-of-day report:
 
 ---
 
+## Syncing across machines
+
+Jejak's knowledge lives in your local Neo4j, so a second machine starts empty. `tools/jejak-sync.py`
+moves knowledge between them — for a one-off migration or an ongoing two-way sync.
+
+```bash
+# on the machine that has the knowledge
+python3 tools/jejak-sync.py export
+#   -> jejak-<host>-<timestamp>.jsonl.gz
+
+# move it however you like: scp, git, USB, Dropbox
+
+# on the other machine
+python3 tools/jejak-sync.py inspect jejak-....jsonl.gz    # look before you leap
+python3 tools/jejak-sync.py import  jejak-....jsonl.gz --dry-run
+python3 tools/jejak-sync.py import  jejak-....jsonl.gz
+```
+
+Run it in both directions and the two machines converge.
+
+### What makes this safe
+
+| Concern | How it's handled |
+|---|---|
+| **Re-running** | `memory_id` is a UUID and is the merge key. Import is idempotent and order-independent — re-importing the same bundle writes nothing. |
+| **Two machines editing the same entry** | Newest `updated_at` wins. `superseded` is monotonic: once an entry is superseded anywhere, it stays superseded, so a correction is never silently undone. |
+| **Different usernames / layouts** | Project paths export as `~/`-relative and expand to the local `$HOME` on import, so `/Users/sam/dev/x` and `/home/sami/dev/x` stay one project instead of forking. |
+| **Bundle size** | `RELATES_TO` is *derived* from shared topics and outnumbers memories ~150:1 (558k edges for 3.7k memories on a real graph). It is never exported — it's rebuilt locally after import. A full knowledge base is a few hundred KB. |
+| **Scores** | `relevance_score` depends on hits, spread and connection count, all of which change when graphs merge. It is not exported; it's recomputed locally with the canonical formula. |
+| **Secrets** | Content is redacted on write *and* again on export. |
+| **Noise** | Raw prompt nodes are excluded by default (`--include-prompts` to keep them). |
+
+Partial exports, for sharing one project's knowledge with a teammate rather than your whole graph:
+
+```bash
+python3 tools/jejak-sync.py export --project ~/dev/myrepo
+python3 tools/jejak-sync.py export --since 2026-01-01
+```
+
+> The bundle is your knowledge in plaintext. If it covers proprietary work, move it the way
+> you'd move a database dump — not through a public repo.
+
 ## Security
 
 Jejak stores everything **locally**. Nothing is sent anywhere.
@@ -215,6 +257,7 @@ Issues and PRs welcome. The codebase is small and deliberately dependency-light:
 | `hooks/serve-graph.py` | Loopback server for the visualization |
 | `tools/bootstrap.py` | Merges hooks into `settings.json`, Jejak rules into `CLAUDE.md` |
 | `tools/apply_schema.py` | Applies the Neo4j + MySQL schema from `db-config.json` |
+| `tools/jejak-sync.py` | Export / import knowledge bundles between machines |
 
 One rule: **the scoring formula lives in `jejak_common.py` and nowhere else.** Hooks and
 CLI must both call it, or rankings drift apart.
