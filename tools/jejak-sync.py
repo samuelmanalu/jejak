@@ -40,6 +40,10 @@ HOME = os.path.expanduser("~")
 # Derived locally, never carried between machines.
 DERIVED_PROPS = {"relevance_score", "score_updated_at", "promoted_at", "level"}
 
+# Serialized as ISO strings in the bundle; MUST be coerced back to Neo4j
+# temporals on import, or duration.between() in the scoring query fails.
+DATETIME_PROPS = ("created_at", "updated_at", "last_accessed_at", "superseded_at")
+
 
 def driver():
     cfg = jejak.load_config("neo4j")
@@ -235,6 +239,12 @@ def cmd_import(args):
                     SET m += row.props,
                         m.superseded = coalesce(m.superseded, false)
                                        OR coalesce(row.props.superseded, false)
+                    // ISO strings -> real temporals, else scoring's
+                    // duration.between() blows up on a String.
+                    SET m.created_at       = CASE WHEN row.props.created_at       IS NULL THEN m.created_at       ELSE datetime(row.props.created_at)       END,
+                        m.updated_at       = CASE WHEN row.props.updated_at       IS NULL THEN m.updated_at       ELSE datetime(row.props.updated_at)       END,
+                        m.last_accessed_at = CASE WHEN row.props.last_accessed_at IS NULL THEN m.last_accessed_at ELSE datetime(row.props.last_accessed_at) END,
+                        m.superseded_at    = CASE WHEN row.props.superseded_at    IS NULL THEN m.superseded_at    ELSE datetime(row.props.superseded_at)    END
                     WITH m, row
                     CALL (m, row) {
                       UNWIND row.topics AS tname
