@@ -741,6 +741,24 @@ def cmd_remote(args):
                 os.makedirs(path, exist_ok=True)
                 git(["init", "-q", "-b", "main"], path)
                 git(["remote", "add", "origin", args.url], path, check=False, quiet=True)
+        # The clone inherits the global git identity. On a work machine that is
+        # usually the employer address, which silently attributes every
+        # knowledge commit to the wrong GitHub account. Pin it here.
+        import subprocess as _sp
+        local_email = _sp.run(["git", "config", "--local", "user.email"],
+                              cwd=path, capture_output=True, text=True).stdout.strip()
+        if args.email:
+            git(["config", "user.email", args.email], path, quiet=True)
+            git(["config", "user.name", args.name or args.email.split("@")[0]], path, quiet=True)
+            print(f"    commit identity pinned to {args.email}")
+        elif not local_email:
+            inherited = _sp.run(["git", "config", "user.email"], cwd=path,
+                                capture_output=True, text=True).stdout.strip()
+            print(f"    ! commit identity is inherited: {inherited or '(unset)'}")
+            print(f"      GitHub credits commits by email. If that is not the account")
+            print(f"      you want credited, set it now:")
+            print(f"        git -C {path} config user.email you@example.com")
+
         readme = os.path.join(path, "README.md")
         if not os.path.exists(readme):
             open(readme, "w").write(
@@ -1145,6 +1163,9 @@ def main():
     rm.add_argument("action", choices=["init", "show"])
     rm.add_argument("url", nargs="?")
     rm.add_argument("--path", help=f"Where to clone (default {DEFAULT_CLONE})")
+    rm.add_argument("--email", help="Git commit email for the knowledge repo "
+                                    "(pins repo-local user.email; avoids inheriting a work address)")
+    rm.add_argument("--name", help="Git commit name for the knowledge repo")
     rm.add_argument("--allow-unverified", action="store_true",
                     help="Skip the private-repo check (you had better be sure)")
     rm.set_defaults(func=cmd_remote)
