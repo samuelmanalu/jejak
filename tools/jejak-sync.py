@@ -56,12 +56,18 @@ HOME = os.path.expanduser("~")
 BEGIN_MARK = "<!-- JEJAK:BEGIN"
 END_MARK = "<!-- JEJAK:END -->"
 
-# Derived locally, never carried between machines.
-DERIVED_PROPS = {"relevance_score", "score_updated_at", "promoted_at", "level"}
+# Derived or purely local; never carried between machines.
+#   relevance_score/score_updated_at/promoted_at/level - recomputed on import
+#   last_accessed_at - local recency telemetry. The session hooks bump it on
+#     every surfaced memory, so syncing it churns the git repo with diffs that
+#     carry no knowledge. hit_count IS synced (it only moves on a real re-save)
+#     and merges as max(), so "this proved useful" survives across machines.
+DERIVED_PROPS = {"relevance_score", "score_updated_at", "promoted_at", "level",
+                 "last_accessed_at"}
 
 # Serialized as ISO strings in the bundle; MUST be coerced back to Neo4j
 # temporals on import, or duration.between() in the scoring query fails.
-DATETIME_PROPS = ("created_at", "updated_at", "last_accessed_at", "superseded_at")
+DATETIME_PROPS = ("created_at", "updated_at", "superseded_at")
 
 
 def driver():
@@ -262,8 +268,12 @@ def cmd_import(args):
                     // duration.between() blows up on a String.
                     SET m.created_at       = CASE WHEN row.props.created_at       IS NULL THEN m.created_at       ELSE datetime(row.props.created_at)       END,
                         m.updated_at       = CASE WHEN row.props.updated_at       IS NULL THEN m.updated_at       ELSE datetime(row.props.updated_at)       END,
-                        m.last_accessed_at = CASE WHEN row.props.last_accessed_at IS NULL THEN m.last_accessed_at ELSE datetime(row.props.last_accessed_at) END,
-                        m.superseded_at    = CASE WHEN row.props.superseded_at    IS NULL THEN m.superseded_at    ELSE datetime(row.props.superseded_at)    END
+                        m.superseded_at    = CASE WHEN row.props.superseded_at    IS NULL THEN m.superseded_at    ELSE datetime(row.props.superseded_at)    END,
+                        // local-only: never arrives in a bundle, seed it for new nodes
+                        m.last_accessed_at = coalesce(m.last_accessed_at, m.created_at, datetime()),
+                        // usefulness is monotonic across machines
+                        m.hit_count        = CASE WHEN coalesce(row.props.hit_count,0) > coalesce(m.hit_count,0)
+                                                  THEN row.props.hit_count ELSE coalesce(m.hit_count,1) END
                     WITH m, row
                     CALL (m, row) {
                       UNWIND row.topics AS tname
@@ -496,6 +506,213 @@ def cmd_restore(args):
         print("\n--dry-run: nothing written.")
 
 
+
+# --------------------------------------------------------------------------
+# git-backed sync  (a private repo as the transport, instead of a server)
+# --------------------------------------------------------------------------
+
+REMOTE_CFG = os.path.join(CLAUDE_HOME, "hooks", "jejak-remote.json")
+DEFAULT_CLONE = os.path.join(CLAUDE_HOME, "jejak-knowledge")
+SHARD_WIDTH = 2  # memory_id[:2] -> 256 shards
+
+
+def git(args, cwd, check=True, quiet=False):
+    import subprocess
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise SystemExit(f"git {' '.join(args)} failed:\n{r.stderr.strip()}")
+    if not quiet and r.stdout.strip():
+        print("    " + r.stdout.strip().replace("\n", "\n    "))
+    return r
+
+
+def remote_config():
+    if not os.path.exists(REMOTE_CFG):
+        raise SystemExit("No knowledge remote configured. Run:\n"
+                         "    python3 tools/jejak-sync.py remote init <git-url>")
+    return json.load(open(REMOTE_CFG))
+
+
+def assert_private(url):
+    """Refuse to sync knowledge into a public GitHub repo.
+
+    A developer's graph is full of employer-internal detail. Making that
+    public is not a mistake you get to undo, so this is a hard gate.
+    """
+    import re
+    import subprocess
+    import urllib.request
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/.]+)", url)
+    if not m:
+        print("    ! Not a GitHub URL - cannot verify it is private. You are on your own.")
+        return
+    owner, repo = m.group(1), m.group(2)
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        try:
+            token = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                                   text=True).stdout.strip() or None
+        except FileNotFoundError:
+            token = None
+    req = urllib.request.Request(f"https://api.github.com/repos/{owner}/{repo}",
+                                 headers={"Accept": "application/vnd.github+json"})
+    if token:
+        req.add_header("Authorization", f"token {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+    except Exception as e:
+        raise SystemExit(f"    ! Could not verify {owner}/{repo} is private ({e}).\n"
+                         f"      Refusing to push knowledge to a repo I cannot check.\n"
+                         f"      Set GITHUB_TOKEN, or use --allow-unverified if you are certain.")
+    if not data.get("private", True):
+        raise SystemExit(
+            f"\n    REFUSING: {owner}/{repo} is PUBLIC.\n"
+            f"    Your graph contains employer-internal detail. Make the repo private:\n"
+            f"        gh repo edit {owner}/{repo} --visibility private\n")
+    print(f"    verified {owner}/{repo} is private")
+
+
+def shard_for(memory_id):
+    return (memory_id[:SHARD_WIDTH] or "00").lower()
+
+
+def write_shards(repo, records):
+    """Deterministic layout: sorted records, sorted keys, one shard per
+    memory_id prefix. A new memory touches one small file, so git diffs stay
+    readable and two machines usually edit different shards."""
+    kdir = os.path.join(repo, "knowledge")
+    os.makedirs(kdir, exist_ok=True)
+    buckets = {}
+    for r in records:
+        buckets.setdefault(shard_for(r["props"]["memory_id"]), []).append(r)
+    for name in os.listdir(kdir):
+        if name.endswith(".jsonl") and name[:-6] not in buckets:
+            os.remove(os.path.join(kdir, name))
+    for shard, recs in buckets.items():
+        recs.sort(key=lambda r: r["props"]["memory_id"])
+        with open(os.path.join(kdir, f"{shard}.jsonl"), "w") as fh:
+            for r in recs:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+    json.dump({"format_version": FORMAT_VERSION, "shard_width": SHARD_WIDTH,
+               "memory_count": len(records)},
+              open(os.path.join(repo, "manifest.json"), "w"), indent=2, sort_keys=True)
+    return len(buckets)
+
+
+def read_shards(repo):
+    kdir = os.path.join(repo, "knowledge")
+    if not os.path.isdir(kdir):
+        return []
+    out = []
+    for name in sorted(os.listdir(kdir)):
+        if name.endswith(".jsonl"):
+            with open(os.path.join(kdir, name)) as fh:
+                out.extend(json.loads(l) for l in fh if l.strip())
+    return out
+
+
+def fetch_records(include_prompts=False):
+    """Same shape export writes, without going through a file."""
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as t:
+        f = os.path.join(t, "g.jsonl.gz")
+        cmd_export(argparse.Namespace(output=f, include_prompts=include_prompts,
+                                      since=None, project=None))
+        _, recs = read_bundle(f)
+    return recs
+
+
+def cmd_remote(args):
+    if args.action == "init":
+        path = os.path.abspath(os.path.expanduser(args.path or DEFAULT_CLONE))
+        if not args.allow_unverified:
+            assert_private(args.url)
+        if os.path.isdir(os.path.join(path, ".git")):
+            print(f"==> Reusing existing clone at {path}")
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            print(f"==> Cloning {args.url} -> {path}")
+            import subprocess
+            r = subprocess.run(["git", "clone", args.url, path],
+                               capture_output=True, text=True)
+            if r.returncode != 0:      # empty repo: init and wire the remote
+                os.makedirs(path, exist_ok=True)
+                git(["init", "-q", "-b", "main"], path)
+                git(["remote", "add", "origin", args.url], path, check=False, quiet=True)
+        readme = os.path.join(path, "README.md")
+        if not os.path.exists(readme):
+            open(readme, "w").write(
+                "# Jejak knowledge\n\nSynced by `jejak-sync`. **Keep this repository private** - "
+                "it contains a developer's working knowledge, including employer-internal detail.\n")
+        json.dump({"url": args.url, "path": path}, open(REMOTE_CFG, "w"), indent=2)
+        os.chmod(REMOTE_CFG, 0o600)
+        print(f"==> Remote configured. Now run:  jejak-sync push")
+    elif args.action == "show":
+        cfg = remote_config()
+        print(f"  url  : {cfg['url']}")
+        print(f"  clone: {cfg['path']}")
+
+
+def cmd_push(args):
+    cfg = remote_config()
+    repo = cfg["path"]
+    if not args.allow_unverified:
+        assert_private(cfg["url"])
+
+    print("==> Collecting knowledge")
+    records = fetch_records(include_prompts=args.include_prompts)
+    n_shards = write_shards(repo, records)
+    print(f"    {len(records)} memories across {n_shards} shards")
+
+    print("==> Committing")
+    git(["add", "-A"], repo, quiet=True)
+    status = git(["status", "--porcelain"], repo, quiet=True)
+    if not status.stdout.strip():
+        print("    nothing changed")
+        return
+    changed = len(status.stdout.strip().splitlines())
+    git(["commit", "-q", "-m",
+         f"knowledge: {len(records)} memories from {jejak.machine_name()}"], repo, quiet=True)
+    print(f"    {changed} shard file(s) changed")
+    if args.no_push:
+        print("    --no-push: committed locally only")
+        return
+    print("==> Pushing")
+    git(["push", "-q", "origin", "HEAD"], repo, quiet=True)
+    print("    pushed")
+
+
+def cmd_pull(args):
+    cfg = remote_config()
+    repo = cfg["path"]
+    print("==> Fetching")
+    git(["pull", "-q", "--no-rebase", "origin", "main"], repo, check=False, quiet=True)
+    records = read_shards(repo)
+    if not records:
+        print("    remote holds no knowledge yet")
+        return
+    print(f"    {len(records)} memories in the repo")
+    with tempfile.TemporaryDirectory() as t:
+        bundle = os.path.join(t, "pulled.jsonl.gz")
+        with gzip.open(bundle, "wt", encoding="utf-8") as fh:
+            fh.write(json.dumps({"kind": "manifest", "format_version": FORMAT_VERSION,
+                                 "source_machine": "git-remote",
+                                 "exported_at": datetime.now(timezone.utc).isoformat(),
+                                 "memory_count": len(records)}) + "\n")
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+        cmd_import(argparse.Namespace(file=bundle, dry_run=args.dry_run))
+
+
+def cmd_sync(args):
+    """pull -> merge -> push: the two machines converge."""
+    cmd_pull(argparse.Namespace(dry_run=False))
+    print()
+    cmd_push(argparse.Namespace(include_prompts=False, no_push=False,
+                                allow_unverified=args.allow_unverified))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Move Jejak knowledge between machines")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -521,6 +738,28 @@ def main():
     r.add_argument("file")
     r.add_argument("--dry-run", action="store_true", help="Report the plan, write nothing")
     r.set_defaults(func=cmd_restore)
+
+    rm = sub.add_parser("remote", help="Configure a private git repo as the sync transport")
+    rm.add_argument("action", choices=["init", "show"])
+    rm.add_argument("url", nargs="?")
+    rm.add_argument("--path", help=f"Where to clone (default {DEFAULT_CLONE})")
+    rm.add_argument("--allow-unverified", action="store_true",
+                    help="Skip the private-repo check (you had better be sure)")
+    rm.set_defaults(func=cmd_remote)
+
+    ps = sub.add_parser("push", help="Export knowledge into the git remote")
+    ps.add_argument("--include-prompts", action="store_true")
+    ps.add_argument("--no-push", action="store_true", help="Commit locally, do not push")
+    ps.add_argument("--allow-unverified", action="store_true")
+    ps.set_defaults(func=cmd_push)
+
+    pl = sub.add_parser("pull", help="Merge knowledge from the git remote")
+    pl.add_argument("--dry-run", action="store_true")
+    pl.set_defaults(func=cmd_pull)
+
+    sy = sub.add_parser("sync", help="pull then push - converge with the remote")
+    sy.add_argument("--allow-unverified", action="store_true")
+    sy.set_defaults(func=cmd_sync)
 
     n = sub.add_parser("inspect", help="Describe a bundle without importing it")
     n.add_argument("file")

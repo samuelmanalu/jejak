@@ -236,6 +236,60 @@ created_at)`. `--dry-run` shows the plan first.
 **Credentials are never in the backup.** `db-config.json` is excluded by design — move
 your passwords yourself. The manifest records `contains_credentials: false`.
 
+### Syncing through a private git repo
+
+Instead of copying files around, point Jejak at a git repo and let it be the transport.
+
+> **Two repos, always.** This repository is the *engine* and is public. Your knowledge goes
+> in a **separate, private** repo — never here. `jejak-sync` enforces that: it calls the
+> GitHub API before every push and refuses if the target is public.
+
+```bash
+# once, on each machine
+python3 tools/jejak-sync.py remote init git@github.com:you/jejak-knowledge.git
+
+# thereafter
+python3 tools/jejak-sync.py push     # local graph -> repo
+python3 tools/jejak-sync.py pull     # repo -> local graph (a merge)
+python3 tools/jejak-sync.py sync     # pull then push: converge
+```
+
+The clone lives at `~/.claude/jejak-knowledge`, well outside any project.
+
+**Storage is sharded, not one blob.** Memories are written to `knowledge/<first 2 chars of
+memory_id>.jsonl` — 256 files, each sorted, with sorted keys. This matters:
+
+| | |
+|---|---|
+| **Small diffs** | Adding one memory changes exactly two files: its shard and the manifest. Not a 500 KB blob rewritten every sync. |
+| **Few conflicts** | Two machines adding different memories almost always land in different shards, so git merges them without a word. |
+| **Readable history** | `git log -p knowledge/` shows what you learned, as text. |
+| **Deterministic** | Re-running `push` with no new knowledge reports *nothing changed*. |
+
+That last point took a fix worth knowing about: `last_accessed_at` is bumped by the session
+hooks on every surfaced memory, so syncing it churned five shards per session with no
+knowledge change. It is now treated as local telemetry and never leaves the machine.
+`hit_count` *is* synced — it only moves on a real re-save — and merges as `max()`, so
+"this proved useful" survives across machines.
+
+Conflicts, if two machines really do edit the same entry, resolve the same way as any
+import: newest `updated_at` wins, and `superseded` stays monotonic.
+
+#### The private-repo gate
+
+```
+REFUSING: you/jejak-knowledge is PUBLIC.
+Your graph contains employer-internal detail. Make the repo private:
+    gh repo edit you/jejak-knowledge --visibility private
+```
+
+It also refuses when it *cannot verify* — a 404, or no token available — rather than
+failing open. Override with `--allow-unverified` only for a non-GitHub remote you trust.
+
+> Measured on a real working graph: **42% of non-prompt memories contained
+> employer-internal detail** — service names, production config, ticket and MR numbers.
+> A public knowledge repo is a data leak, not a privacy preference.
+
 ### What makes this safe
 
 | Concern | How it's handled |
