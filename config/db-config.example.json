@@ -1,0 +1,13 @@
+{
+  "neo4j": {
+    "uri": "bolt://localhost:7687",
+    "user": "neo4j",
+    "password": "CHANGE_ME"
+  },
+  "mysql": {
+    "host": "localhost",
+    "user": "root",
+    "password": "CHANGE_ME",
+    "database": "claude_logs"
+  }
+}

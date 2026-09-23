@@ -1,0 +1,46 @@
+<!-- Append this to ~/.claude/CLAUDE.md to make Jejak always-active. -->
+
+# Jejak — Always Active
+
+You have a Jejak knowledge-graph system backed by Neo4j. Use the `/jejak` skill for all operations.
+
+## Auto-Save Rule
+
+After EVERY meaningful action, save the knowledge using `/jejak save`. This is not optional.
+
+Triggers — save immediately after each:
+- Solving a bug: save `learning` (root cause) + `solution` (the fix)
+- Making a design/architectural choice: save `decision` or `architecture`
+- Discovering a codebase pattern or convention: save `convention`
+- Finding an issue or unexpected behavior: save `issue`
+- Answering a "why" or providing context: save `context`
+- Exploring code and finding something noteworthy: save `finding`
+
+## Code Links
+
+When knowledge relates to a specific file, ALWAYS include the `-f` flag:
+```
+jejak save learning "Disbursal uses LAZY fetch to prevent OOM" -f "src/main/java/Disbursal.java"
+```
+
+## Dedup + Conflict Rule
+
+Before every save, run `check-duplicates` first. You judge semantically:
+- **Duplicate** (same meaning, different words): skip silently
+- **Conflict** (contradicts existing knowledge): ask the user which is current
+- **Unique**: save it
+
+## What NOT to save
+
+- Trivial file reads with no insight
+- Commands that produced no useful output
+- Knowledge obvious from the code itself
+- Prompts or conversational filler
+
+## Answering Questions
+
+When the user asks a "why" or "how" question about the project, check the graph first:
+```
+jejak ask "why did we change the batch reference format"
+```
+Use the results to inform your answer. If the graph doesn't have it, explore the codebase.

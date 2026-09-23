@@ -1,0 +1,27 @@
+# --- Secrets: never commit ---
+db-config.json
+hooks/db-config.json
+config/db-config.json
+*.pem
+*.key
+.env
+.env.*
+
+# --- Local knowledge data: never commit ---
+# Jejak's knowledge lives in Neo4j/MySQL, not in this repo.
+*.dump
+*.db
+*.sqlite
+dumps/
+export/
+*-errors.log
+logs/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- OS ---
+.DS_Store
