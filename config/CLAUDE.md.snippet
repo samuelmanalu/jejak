@@ -1,10 +1,12 @@
-<!-- Append this to ~/.claude/CLAUDE.md to make Jejak always-active. -->
-
+<!-- JEJAK:BEGIN - managed by install.sh, edits between these markers are overwritten -->
 # Jejak — Always Active
 
-You have a Jejak knowledge-graph system backed by Neo4j. Use the `/jejak` skill for all operations.
+You have a Jejak knowledge-graph system backed by Neo4j. It is the **single interface**
+for engineering knowledge on this machine: everything added, updated, or looked up goes
+through the `/jejak` skill. Never write to Neo4j directly, and never keep a parallel
+notes file for what belongs in the graph.
 
-## Auto-Save Rule
+## 1. ADD — Auto-Save Rule
 
 After EVERY meaningful action, save the knowledge using `/jejak save`. This is not optional.
 
@@ -16,31 +18,66 @@ Triggers — save immediately after each:
 - Answering a "why" or providing context: save `context`
 - Exploring code and finding something noteworthy: save `finding`
 
-## Code Links
+Valid types: `decision`, `learning`, `finding`, `issue`, `solution`, `architecture`,
+`convention`, `context`.
 
-When knowledge relates to a specific file, ALWAYS include the `-f` flag:
+### Code links
+When knowledge relates to a specific file, ALWAYS include `-f`:
 ```
 jejak save learning "Disbursal uses LAZY fetch to prevent OOM" -f "src/main/java/Disbursal.java"
 ```
 
-## Dedup + Conflict Rule
+## 2. UPDATE — Supersede, never duplicate
 
-Before every save, run `check-duplicates` first. You judge semantically:
-- **Duplicate** (same meaning, different words): skip silently
-- **Conflict** (contradicts existing knowledge): ask the user which is current
+Knowledge is append-only with reversible superseding. To correct or replace an entry,
+save the new version and point it at the old one:
+```
+jejak save decision "Pool size is now 25, raised from 10 after the timeout incident" --supersedes 3f8b6a70
+```
+The old entry stays in the database for audit but drops out of active views. Never
+silently save a contradicting entry without `--supersedes` — that leaves two
+entries claiming different truths and the ranking cannot tell which is current.
+
+### Dedup + conflict rule (MANDATORY before every save)
+Run `check-duplicates` first, then judge semantically:
+```
+jejak check-duplicates "<content>" -d "$(pwd)"
+```
+- **Duplicate** (same meaning, different words): skip silently, do not save
+- **Conflict** (contradicts an existing entry): ask the user which is current, then
+  save the correct one with `--supersedes <old-id>`
 - **Unique**: save it
+- `NO_EXISTING_KNOWLEDGE`: proceed, it's the first entry
+
+## 3. LOOK UP — Check the graph before exploring code
+
+When the user asks a "why" or "how" question about a project, query Jejak BEFORE
+reading the codebase:
+```
+jejak ask "why did we change the batch reference format"
+```
+Other lookups:
+| Need | Command |
+|---|---|
+| Answer a question from stored knowledge | `jejak ask "<question>"` |
+| Find entries by keyword | `jejak search <query>` |
+| Everything known about this project | `jejak map [directory]` |
+| What matters most here | `jejak rank [directory] [-a]` |
+| Why an entry matters / what it connects to | `jejak links <memory_id>` |
+| Recurring themes | `jejak topics [directory]` |
+| One session's output | `jejak session [session_id]` |
+| Whole-graph counts | `jejak stats` |
+| Hand knowledge to a teammate | `jejak export [directory] [-a]` |
+
+Escalation order — stop as soon as you have the answer:
+**L1/L2** auto-loaded context → **L3** `jejak ask` / `jejak search` → **L4** read the code.
+If the graph answers it, do not re-derive it from the codebase. If the graph is wrong,
+correct it with `--supersedes` as part of answering.
 
 ## What NOT to save
-
 - Trivial file reads with no insight
 - Commands that produced no useful output
 - Knowledge obvious from the code itself
 - Prompts or conversational filler
-
-## Answering Questions
-
-When the user asks a "why" or "how" question about the project, check the graph first:
-```
-jejak ask "why did we change the batch reference format"
-```
-Use the results to inform your answer. If the graph doesn't have it, explore the codebase.
+- Secrets — they are redacted automatically, but do not paste them deliberately
+<!-- JEJAK:END -->

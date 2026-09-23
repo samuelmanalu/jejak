@@ -88,19 +88,34 @@ never touched. That's the whole design: **the math decides, not you.**
 git clone https://github.com/samuelmanalu/jejak.git
 cd jejak
 ./install.sh
+# edit ~/.claude/hooks/db-config.json with your credentials
+./install.sh          # re-run: applies schema and finishes
 ```
 
-Then:
+That's the whole install. `install.sh` does all of it:
 
-1. **Credentials** — edit `~/.claude/hooks/db-config.json` (created from the example, `chmod 600`).
-2. **Schema**
-   ```bash
-   cypher-shell -u neo4j -p YOURPASS -f schema/neo4j.cypher
-   mysql -u root -p < schema/mysql.sql
-   ```
-3. **Wire it up** — merge `config/settings.example.json` into `~/.claude/settings.json`,
-   and append `config/CLAUDE.md.snippet` to `~/.claude/CLAUDE.md` (this is what makes
-   Claude save knowledge without being asked).
+1. installs the Python dependencies
+2. copies the hooks and skills into `~/.claude`
+3. seeds `db-config.json` (and never overwrites one you already have)
+4. applies the Neo4j and MySQL schema
+5. **registers the hooks in `~/.claude/settings.json`**
+6. **inserts the Jejak rules into `~/.claude/CLAUDE.md`**
+7. verifies the CLI can reach the database
+
+Steps 5 and 6 merge into whatever you already have — your own hooks, your own rules,
+and any other top-level settings are preserved. The `CLAUDE.md` rules live between
+`<!-- JEJAK:BEGIN -->` / `<!-- JEJAK:END -->` markers, so upgrading refreshes that block
+in place and leaves the rest of the file untouched.
+
+Re-running is safe: hooks are matched on (event, matcher, command) so nothing is ever
+registered twice, and every file the installer rewrites is backed up as
+`<file>.pre-jejak.<timestamp>` first.
+
+Installing somewhere else:
+
+```bash
+CLAUDE_HOME=/path/to/.claude ./install.sh
+```
 
 Restart Claude Code, then:
 
@@ -108,12 +123,23 @@ Restart Claude Code, then:
 /jejak stats
 ```
 
----
+### What the CLAUDE.md rules do
+
+They are what makes Jejak automatic rather than a tool you have to remember. They tell
+Claude that the graph is the single interface for knowledge:
+
+- **Add** — save after every meaningful action, typed, with `-f` linking it to the code
+- **Update** — correct an entry with `--supersedes <id>`, never leave two entries
+  disagreeing; run `check-duplicates` before every save
+- **Look up** — query the graph with `jejak ask` / `search` / `map` *before* reading the
+  codebase, and stop as soon as it answers
 
 ## Usage
 
 ```
 /jejak save <type> <content>     Save a knowledge entry (dedup-checked)
+/jejak save ... --supersedes <id> Update: replace an existing entry
+/jejak check-duplicates <text>   Check for duplicates/conflicts before saving
 /jejak search <query>            Search across all knowledge
 /jejak ask <question>            Answer a question from the graph
 /jejak map [directory]           Full knowledge map for a project
@@ -187,6 +213,8 @@ Issues and PRs welcome. The codebase is small and deliberately dependency-light:
 | `hooks/prompt-logger.py` | MySQL prompt log |
 | `hooks/recap-cli.py` | `/recap` data collector |
 | `hooks/serve-graph.py` | Loopback server for the visualization |
+| `tools/bootstrap.py` | Merges hooks into `settings.json`, Jejak rules into `CLAUDE.md` |
+| `tools/apply_schema.py` | Applies the Neo4j + MySQL schema from `db-config.json` |
 
 One rule: **the scoring formula lives in `jejak_common.py` and nowhere else.** Hooks and
 CLI must both call it, or rankings drift apart.

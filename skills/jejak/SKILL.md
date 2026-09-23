@@ -14,6 +14,7 @@ Save, search, map, rank, and browse linked knowledge stored in Neo4j. Knowledge 
 ```
 /jejak                              Interactive menu
 /jejak save <type> <content>        Save a knowledge entry (with dedup check)
+/jejak save ... --supersedes <id>   Update: replace an existing entry
 /jejak map [directory]              Show full knowledge map for a project
 /jejak search <query>               Search across all knowledge
 /jejak session [session_id]         Show all knowledge from a session
@@ -82,12 +83,25 @@ python3 ~/.claude/hooks/jejak-cli.py save <type> "<content>" -d "$(pwd)" -s "$SE
 - `-d`: current working directory
 - `-s`: session ID if available
 - `-f`: (optional) source file path related to this knowledge (e.g. the file where a pattern was found)
+- `--supersedes`: (optional) 8-char id of the entry this one replaces — see Updating below
 
 **Before saving, you MUST run `check-duplicates` first (see Deduplication below).**
 
 When the knowledge relates to a specific file, ALWAYS include `-f` with the file path. This creates a code link so `/jejak links` and `/jejak ask` can point back to the relevant code.
 
 After saving, confirm to the user with the memory ID, score, and project name.
+
+### Updating knowledge (supersede)
+
+Knowledge is append-only. To correct or replace an entry, save the new version pointing
+at the old one — never edit Neo4j directly and never leave two entries disagreeing:
+
+```bash
+python3 ~/.claude/hooks/jejak-cli.py save decision "Pool size is now 25" --supersedes 3f8b6a70
+```
+
+The superseded entry stays in the database for audit (`superseded`, `superseded_at`,
+`superseded_by`) but is filtered out of active views and rankings. This is reversible.
 
 ### map
 

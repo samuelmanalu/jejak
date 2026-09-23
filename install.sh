@@ -1,42 +1,88 @@
 #!/usr/bin/env bash
-# Jejak installer — copies hooks + skills into ~/.claude and seeds config.
-# Idempotent: re-running overwrites code, never your db-config.json.
+# Jejak installer — reproduces a complete working Jejak setup.
+#
+#   1. installs Python dependencies
+#   2. copies hooks + skills into ~/.claude
+#   3. seeds db-config.json (never overwrites an existing one)
+#   4. applies the Neo4j + MySQL schema
+#   5. registers the hooks in ~/.claude/settings.json
+#   6. inserts the Jejak rules into ~/.claude/CLAUDE.md
+#   7. verifies the install
+#
+# Idempotent: safe to re-run. Every file it rewrites is backed up first.
+# Override the target with CLAUDE_HOME=/some/path ./install.sh
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${CLAUDE_HOME:-$HOME/.claude}"
+CFG="$DEST/hooks/db-config.json"
 
 echo "==> Installing Jejak into $DEST"
-mkdir -p "$DEST/hooks" "$DEST/skills/jejak" "$DEST/skills/recap" "$DEST/logs"
 
-cp "$SRC"/hooks/*.py "$SRC"/hooks/*.html "$DEST/hooks/"
-cp "$SRC"/skills/jejak/SKILL.md "$DEST/skills/jejak/"
-cp "$SRC"/skills/recap/SKILL.md "$DEST/skills/recap/"
-
-if [ ! -f "$DEST/hooks/db-config.json" ]; then
-  cp "$SRC/config/db-config.example.json" "$DEST/hooks/db-config.json"
-  echo "    created $DEST/hooks/db-config.json  <-- EDIT THIS (passwords are CHANGE_ME)"
-else
-  echo "    kept existing $DEST/hooks/db-config.json"
-fi
-chmod 600 "$DEST/hooks/db-config.json"
-
+# --- 1. dependencies ------------------------------------------------------
 echo "==> Python dependencies"
 python3 -m pip install --quiet --upgrade -r "$SRC/requirements.txt"
 
-cat <<'NEXT'
+# --- 2. code --------------------------------------------------------------
+mkdir -p "$DEST/hooks" "$DEST/skills/jejak" "$DEST/skills/recap" "$DEST/logs"
+cp "$SRC"/hooks/*.py "$SRC"/hooks/*.html "$DEST/hooks/"
+cp "$SRC"/skills/jejak/SKILL.md "$DEST/skills/jejak/"
+cp "$SRC"/skills/recap/SKILL.md "$DEST/skills/recap/"
+echo "==> Copied hooks and skills"
 
-Installed. Three manual steps remain:
+# --- 3. credentials -------------------------------------------------------
+if [ ! -f "$CFG" ]; then
+  cp "$SRC/config/db-config.example.json" "$CFG"
+  echo "==> Created $CFG"
+  echo "    !! Passwords are CHANGE_ME — edit it, then re-run ./install.sh"
+  SEEDED=1
+else
+  echo "==> Kept existing $CFG"
+  SEEDED=0
+fi
+chmod 600 "$CFG"
 
-  1. Edit ~/.claude/hooks/db-config.json with your Neo4j + MySQL credentials.
+# --- 4. schema ------------------------------------------------------------
+if [ "$SEEDED" = "0" ] && ! grep -q 'CHANGE_ME' "$CFG"; then
+  echo "==> Applying schema"
+  python3 "$SRC/tools/apply_schema.py" || {
+    echo "    !! Schema step failed. Apply by hand:"
+    echo "       cypher-shell -u USER -p PASS -f $SRC/schema/neo4j.cypher"
+    echo "       mysql -u USER -p < $SRC/schema/mysql.sql"
+  }
+else
+  echo "==> Skipping schema (credentials not set yet)"
+fi
 
-  2. Create the schema:
-       cypher-shell -u neo4j -p YOURPASS -f schema/neo4j.cypher
-       mysql -u root -p < schema/mysql.sql
+# --- 5+6. hooks + CLAUDE.md ----------------------------------------------
+python3 "$SRC/tools/bootstrap.py"
 
-  3. Register the hooks: merge config/settings.example.json into
-     ~/.claude/settings.json, and append config/CLAUDE.md.snippet to
-     ~/.claude/CLAUDE.md.
+# --- 7. verify ------------------------------------------------------------
+echo "==> Verifying"
+if [ "$SEEDED" = "1" ] || grep -q 'CHANGE_ME' "$CFG"; then
+  cat <<NEXT
 
-Then restart Claude Code and run:  /jejak stats
+Almost there. Two steps left:
+
+  1. Edit $CFG with your Neo4j + MySQL credentials.
+  2. Re-run ./install.sh — it will apply the schema and finish.
+
+NEXT
+  exit 0
+fi
+
+python3 "$DEST/hooks/jejak-cli.py" stats >/dev/null 2>&1 \
+  && echo "    Jejak CLI reaches the database" \
+  || { echo "    !! Jejak CLI cannot reach the database — check $CFG"; exit 1; }
+
+cat <<NEXT
+
+Jejak is installed.
+
+  Restart Claude Code, then try:
+     /jejak stats
+     /jejak ask "what do we know about this project"
+
+  Visualization:  python3 ~/.claude/hooks/serve-graph.py   -> http://127.0.0.1:8787
+
 NEXT
