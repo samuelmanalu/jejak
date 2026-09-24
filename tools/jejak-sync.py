@@ -150,9 +150,10 @@ def cmd_export(args):
                 rec = {
                     "kind": "memory",
                     "props": props,
-                    "topics": [t for t in r["topics"] if t],
-                    "projects": [portable(p) for p in r["projects"] if p],
-                    "sessions": [s for s in r["sessions"] if s],
+                    # collect() order is arbitrary; sort so output is reproducible
+                    "topics": sorted(t for t in r["topics"] if t),
+                    "projects": sorted(portable(p) for p in r["projects"] if p),
+                    "sessions": sorted(s for s in r["sessions"] if s),
                 }
                 fh.write(json.dumps(rec) + "\n")
                 n += 1
@@ -691,6 +692,11 @@ def write_shards(repo, records):
         recs.sort(key=lambda r: r["props"]["memory_id"])
         with open(os.path.join(kdir, f"{shard}.jsonl"), "w") as fh:
             for r in recs:
+                # Records from an older engine carry these unsorted; normalise
+                # here too, or machines rewrite each other's shards every push.
+                for k in ("topics", "projects", "sessions"):
+                    if isinstance(r.get(k), list):
+                        r[k] = sorted(r[k])
                 fh.write(json.dumps(r, sort_keys=True) + "\n")
     kdir_files = sorted(f for f in os.listdir(kdir) if f.endswith(".jsonl"))
     json.dump({"format_version": FORMAT_VERSION, "shard_width": SHARD_WIDTH,
