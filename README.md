@@ -108,7 +108,9 @@ Knowledge syncs; prompt history does not — that machine's `/recap` starts empt
 
 ## Install
 
-**Requirements:** Python 3.9+, [Neo4j](https://neo4j.com/download/) 5.x, MySQL 8.x, Claude Code.
+**Requirements:** Python 3.9+, [Neo4j](https://neo4j.com/download/) 5.x or 2025+ (calendar
+versions; Homebrew ships 2026.x), MySQL 8.x (`brew install mysql@8.4` — plain `mysql` is newer),
+Claude Code.
 
 ```bash
 git clone https://github.com/samuelmanalu/jejak.git

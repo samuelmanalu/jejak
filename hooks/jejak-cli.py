@@ -671,10 +671,10 @@ def cmd_stats(args):
     try:
         with driver.session() as session:
             result = session.run("""
-                MATCH (m:Memory) WITH count(m) AS memories
-                MATCH (p:Project) WITH memories, count(p) AS projects
-                MATCH (s:Session) WITH memories, projects, count(s) AS sessions
-                MATCH (t:Topic) WITH memories, projects, sessions, count(t) AS topics
+                OPTIONAL MATCH (m:Memory) WITH count(m) AS memories
+                OPTIONAL MATCH (p:Project) WITH memories, count(p) AS projects
+                OPTIONAL MATCH (s:Session) WITH memories, projects, count(s) AS sessions
+                OPTIONAL MATCH (t:Topic) WITH memories, projects, sessions, count(t) AS topics
                 RETURN memories, projects, sessions, topics
             """).single()
 
@@ -693,7 +693,7 @@ def cmd_stats(args):
             """)
             print("  Projects:")
             for p in projects:
-                print(f"    {p['name']:25s}  {p['mem_count']:4d} memories  ({p['path']})")
+                print(f"    {p['name'] or '?':25s}  {p['mem_count']:4d} memories  ({p['path']})")
 
             print()
             machines = session.run("""
@@ -704,7 +704,7 @@ def cmd_stats(args):
             """)
             print("  Machines:")
             for m in machines:
-                print(f"    {m['machine']:25s}  {m['count']:4d} memories")
+                print(f"    {m['machine'] or '?':25s}  {m['count']:4d} memories")
     finally:
         driver.close()
 

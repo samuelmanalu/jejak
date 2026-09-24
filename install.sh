@@ -74,9 +74,15 @@ NEXT
   exit 0
 fi
 
-python3 "$DEST/hooks/jejak-cli.py" stats >/dev/null 2>&1 \
-  && echo "    Jejak CLI reaches the database" \
-  || { echo "    !! Jejak CLI cannot reach the database — check $CFG"; exit 1; }
+# Any failure lands here (unreachable DB, bad credentials, a crashing query),
+# so show the real error instead of guessing at the cause.
+if STATS_OUT=$(python3 "$DEST/hooks/jejak-cli.py" stats 2>&1); then
+  echo "    Jejak CLI reaches the database"
+else
+  echo "    !! 'jejak-cli.py stats' failed (config: $CFG):"
+  printf '%s\n' "$STATS_OUT" | tail -5 | sed 's/^/       /'
+  exit 1
+fi
 
 cat <<NEXT
 

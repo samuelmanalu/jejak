@@ -41,7 +41,6 @@ import gzip
 import io
 import json
 import os
-import socket
 import sys
 import tarfile
 import tempfile
@@ -98,7 +97,7 @@ def iso(v):
 # --------------------------------------------------------------------------
 
 def cmd_export(args):
-    out = args.output or f"jejak-{socket.gethostname()}-{datetime.now():%Y%m%d-%H%M%S}.jsonl.gz"
+    out = args.output or f"jejak-{jejak.machine_name()}-{datetime.now():%Y%m%d-%H%M%S}.jsonl.gz"
 
     where = ["coalesce(m.type,'') <> ''"]
     params = {}
@@ -262,9 +261,16 @@ def cmd_import(args):
                 return
 
             todo = new + updated
-            if not todo:
+            # Merged but never scored = an earlier import died before its derived
+            # steps. Without this, every re-run reports "up to date" and they never run.
+            unfinished = [r["id"] for r in session.run(
+                "MATCH (m:Memory) WHERE m.type <> 'prompt' AND m.relevance_score IS NULL "
+                "RETURN m.memory_id AS id")]
+            if not todo and not unfinished:
                 print("\nNothing to do — this machine is already up to date.")
                 return
+            if unfinished:
+                print(f"    unfinished: {len(unfinished)}  (merged by an interrupted import; finishing)")
 
             for i in range(0, len(todo), 200):
                 batch = [{
@@ -284,8 +290,11 @@ def cmd_import(args):
                     SET m.created_at       = CASE WHEN row.props.created_at       IS NULL THEN m.created_at       ELSE datetime(row.props.created_at)       END,
                         m.updated_at       = CASE WHEN row.props.updated_at       IS NULL THEN m.updated_at       ELSE datetime(row.props.updated_at)       END,
                         m.superseded_at    = CASE WHEN row.props.superseded_at    IS NULL THEN m.superseded_at    ELSE datetime(row.props.superseded_at)    END,
-                        // local-only: never arrives in a bundle, seed it for new nodes
-                        m.last_accessed_at = coalesce(m.last_accessed_at, m.created_at, datetime()),
+                        // local-only: never arrives in a bundle, seed it for new nodes.
+                        // Convert from row, not m.created_at: Cypher 25 evaluates every
+                        // SET item before assigning, so m.created_at is still the String.
+                        m.last_accessed_at = coalesce(m.last_accessed_at, datetime(row.props.created_at),
+                                                      m.created_at, datetime()),
                         // usefulness is monotonic across machines
                         m.hit_count        = CASE WHEN coalesce(row.props.hit_count,0) > coalesce(m.hit_count,0)
                                                   THEN row.props.hit_count ELSE coalesce(m.hit_count,1) END
@@ -308,8 +317,17 @@ def cmd_import(args):
                 """, batch=batch)
                 print(f"    merged {min(i+200, len(todo))}/{len(todo)}")
 
+            # Projects arrive as bare paths; name them the way the hooks do.
+            unnamed = [r["path"] for r in session.run(
+                "MATCH (p:Project) WHERE p.name IS NULL RETURN p.path AS path")]
+            if unnamed:
+                session.run("""
+                    UNWIND $rows AS row
+                    MATCH (p:Project {path: row.path}) SET p.name = row.name
+                """, rows=[{"path": p, "name": jejak.extract_project_name(p)} for p in unnamed])
+
             print("==> Rebuilding RELATES_TO (derived from shared topics)")
-            touched = [r["props"]["memory_id"] for r in todo]
+            touched = list({r["props"]["memory_id"] for r in todo} | set(unfinished))
             for i in range(0, len(touched), 100):
                 session.run("""
                     UNWIND $ids AS mid
@@ -410,7 +428,7 @@ def load_prompt_logs(path, dry_run=False):
 
 
 def cmd_backup(args):
-    out = args.output or f"jejak-backup-{socket.gethostname()}-{datetime.now():%Y%m%d-%H%M%S}.tar.gz"
+    out = args.output or f"jejak-backup-{jejak.machine_name()}-{datetime.now():%Y%m%d-%H%M%S}.tar.gz"
     out = os.path.abspath(out)
 
     with tempfile.TemporaryDirectory() as tmp:

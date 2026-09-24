@@ -11,6 +11,8 @@ import json
 import os
 import re
 import socket
+import subprocess
+import sys
 from datetime import datetime
 
 # --- Config -----------------------------------------------------------------
@@ -104,6 +106,18 @@ def extract_project_name(cwd):
     return parts[-1] if parts else "unknown"
 
 def machine_name():
+    # On macOS with no HostName set, gethostname() is whatever the current
+    # network's DHCP/VPN hands out, so one laptop drifts across many names.
+    # Prefer an explicit HostName, then the stable LocalHostName.
+    if sys.platform == "darwin":
+        for key in ("HostName", "LocalHostName"):
+            try:
+                name = subprocess.run(["scutil", "--get", key], capture_output=True,
+                                      text=True, timeout=2).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                name = ""
+            if name:
+                return name
     return socket.gethostname()
 
 # --- Canonical scoring (the ONE formula, with decay) ------------------------

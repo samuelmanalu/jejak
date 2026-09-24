@@ -3,7 +3,6 @@ import json
 import sys
 import os
 import re
-import socket
 import mysql.connector
 
 sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
@@ -60,7 +59,7 @@ def main():
 
     tags = categorize(prompt)
     prompt = jejak.redact(prompt)  # scrub secrets before storing
-    machine_name = socket.gethostname()
+    machine_name = jejak.machine_name()
 
     try:
         db_config = load_db_config()
