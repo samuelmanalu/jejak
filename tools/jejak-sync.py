@@ -819,9 +819,19 @@ def cmd_push(args):
     print("==> Collecting knowledge")
     records = fetch_records(include_prompts=args.include_prompts)
     records = [r for r in records if r["props"]["memory_id"] not in tombs]
+    # Deletion only ever happens through tombstones, so a repo record missing
+    # from the local graph is one this machine has not pulled yet (e.g. merged
+    # in by an earlier push's retry). Keep it, or this push erases another
+    # machine's knowledge from the repo.
+    local_ids = {r["props"]["memory_id"] for r in records}
+    kept = [r for r in read_shards(repo, strict=False)
+            if r["props"]["memory_id"] not in local_ids
+            and r["props"]["memory_id"] not in tombs]
+    records += kept
     n_shards = write_shards(repo, records)
     write_tombstones(repo, tombs)
-    print(f"    {len(records)} memories across {n_shards} shards")
+    print(f"    {len(records)} memories across {n_shards} shards"
+          + (f" ({len(kept)} kept from the repo, not yet pulled here)" if kept else ""))
 
     print("==> Committing")
     git(["add", "-A"], repo, quiet=True)
@@ -869,8 +879,8 @@ def cmd_push(args):
             raise SystemExit(f"    push failed:\n{r.stderr.strip()}")
         print(f"    remote moved; merging and retrying ({attempt}/3)")
         git(["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"], repo, check=False, quiet=True)
-        # A conflicted shard is resolved by re-deriving it: the local graph
-        # already merged the remote records on pull, so ours is the superset.
+        # A conflicted shard is resolved by re-deriving it from the union of
+        # both sides' records, newest updated_at winning per memory.
         st = git(["diff", "--name-only", "--diff-filter=U"], repo, quiet=True)
         if st.stdout.strip():
             conflicted = st.stdout.strip().splitlines()

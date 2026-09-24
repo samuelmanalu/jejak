@@ -305,8 +305,10 @@ import: newest `updated_at` wins, and `superseded` stays monotonic.
 
 #### Syncing on a timer
 
-`SessionEnd` only fires when a session ends cleanly. For knowledge to reach the repo
-regardless, install the daemon:
+`SessionEnd` only fires when a session ends cleanly, and it only pushes. For knowledge to
+reach the repo regardless — and for other machines' knowledge to reach this one — install the
+daemon. Each tick pulls first, then pushes anything new (or any commit a failed push left
+behind), so two machines converge within one interval:
 
 ```bash
 python3 tools/jejak-sync.py daemon install --interval 900   # every 15 min
@@ -321,7 +323,8 @@ Elsewhere it writes the config and prints the crontab line to use. The interval 
 
 **Detection is deterministic; the model only writes the message.** Whether knowledge is
 unsynced is a set difference between the graph and the repo — a fact, not a judgement — so
-no model sits in that path. An idle tick costs ~0.4s, makes no commit and calls nothing.
+no model sits in that path. An idle tick costs ~2s (mostly the `git pull`), makes no commit,
+writes no log line and calls no model.
 
 When there *is* new knowledge, Haiku (via the same `claude -p` path the extractor uses)
 turns the commit subject into something you can read months later:
@@ -377,8 +380,9 @@ never raised, because a missed push is recoverable and a blocked session is not.
 
 **2. Push converges instead of failing.** A plain `git push` is rejected the moment another
 machine has pushed — leaving your knowledge committed locally and never stored. `push` now
-merges and retries (3 attempts). If a shard conflicts, it is re-derived from the merged graph
-rather than hand-resolved, because after the pull the local graph is already the superset.
+merges and retries (3 attempts). If a shard conflicts, it is re-derived from the union of both
+sides rather than hand-resolved. And because deletion only ever happens through tombstones, a
+repo record this machine has not pulled yet is kept, never erased by a push from the graph.
 
 **3. Integrity is checkable.** The manifest carries a SHA-256 and record count per shard:
 

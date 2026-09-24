@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Jejak sync daemon — periodically push new knowledge to the private git repo.
+Jejak sync daemon — periodically pull other machines' knowledge from the
+private git repo, then push this machine's new knowledge to it.
 
 Runs on a configurable interval (launchd on macOS, cron elsewhere).
 
@@ -103,6 +104,16 @@ def unsynced():
     return [r for r in rows if r["id"] not in in_repo], repo
 
 
+def unpushed(repo):
+    """Local commits that never reached origin/main."""
+    r = subprocess.run(["git", "rev-list", "--count", "origin/main..HEAD"],
+                       cwd=repo, capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
 def summarize(items, model):
     """One line describing what is new. Best-effort: never blocks the sync."""
     listing = "\n".join(f"- [{it['type']}] {it['content']}" for it in items)
@@ -126,6 +137,29 @@ def summarize(items, model):
     return None
 
 
+def pull(verbose=False):
+    """Bring other machines' knowledge into the local graph. Idempotent and
+    tombstone-aware, so running it every tick is safe. A failure is logged and
+    never blocks the push: backing up this machine matters more."""
+    try:
+        r = subprocess.run(["python3", SYNC, "pull"], capture_output=True,
+                           text=True, timeout=600)
+    except Exception as e:
+        jejak.log_error("jejak-daemon/pull", e)
+        return
+    out = (r.stdout or "").strip()
+    if r.returncode != 0:
+        tail = (r.stderr or out).strip().splitlines()
+        jejak.log_error("jejak-daemon/pull", f"rc={r.returncode} :: " + (tail[-1] if tail else ""))
+    elif "already up to date" not in out:
+        # Only a pull that changed something is worth a log line.
+        summary = [l.strip() for l in out.splitlines()
+                   if l.strip().startswith(("new ", "updated ", "unfinished:", "tombstones:"))]
+        jejak.log_error("jejak-daemon/info", "pulled :: " + "; ".join(summary))
+    if verbose:
+        print(out or (r.stderr or "").strip())
+
+
 def run_once(verbose=False):
     if not os.path.exists(REMOTE_CFG):
         if verbose:
@@ -138,16 +172,23 @@ def run_once(verbose=False):
                 print("another run is in progress")
             return 0
 
+        pull(verbose)
         items, repo = unsynced()
         if not items:
-            if verbose:
-                print("up to date - nothing new to sync")
-            return 0
+            # Committed but never pushed (a push that died on the network, or
+            # --no-push): the graph matches the working tree, so only git knows.
+            if not unpushed(repo):
+                if verbose:
+                    print("up to date - nothing new to sync")
+                return 0
+            items = []
         if verbose:
             print(f"{len(items)} unsynced memory(ies)")
 
         subject = None
-        if cfg["summarize"]:
+        if not items:
+            subject = "knowledge: push unpushed commits"  # push reuses the existing commit
+        elif cfg["summarize"]:
             subject = summarize(items[: cfg["max_summary_items"]], cfg["model"])
         if not subject:
             kinds = {}
