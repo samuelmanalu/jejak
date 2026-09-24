@@ -318,6 +318,8 @@ python3 tools/jejak-sync.py daemon uninstall
 ```
 
 On macOS this writes a launchd agent (`tech.jejak.sync`), so it survives logout and reboot.
+It also runs once at login rather than 15 minutes later: it waits up to 3 minutes for Neo4j
+to finish booting, and ignores a lock left by a run that shutdown killed.
 Elsewhere it writes the config and prints the crontab line to use. The interval lives in
 `~/.claude/hooks/jejak-daemon.json` and the minimum is 60s.
 

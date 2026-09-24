@@ -1080,7 +1080,7 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
     <string>{script}</string>
   </array>
   <key>StartInterval</key><integer>{interval}</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
   <key>EnvironmentVariables</key>

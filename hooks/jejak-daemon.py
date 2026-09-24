@@ -48,6 +48,21 @@ def config():
     return cfg
 
 
+def boot_time():
+    """Epoch seconds of the last boot, or 0 when it cannot be read."""
+    try:
+        if sys.platform == "darwin":  # "{ sec = 1727160000, usec = 0 } ..."
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            return float(out.split("sec =")[1].split(",")[0])
+        for line in open("/proc/stat"):
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
 class Lock:
     """Overlapping runs would fight over the git index. Stale locks (a killed
     run) expire, so a crash never wedges the daemon permanently."""
@@ -58,13 +73,26 @@ class Lock:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         if os.path.exists(self.path):
             age = time.time() - os.path.getmtime(self.path)
-            if age < self.stale_after:
+            # A run killed by shutdown or `launchctl unload` leaves its lock
+            # behind; without the PID check the first tick after a reboot skips.
+            # PIDs restart at boot, so a pre-boot lock is stale even if its PID is taken.
+            if (age < self.stale_after and self._holder_alive()
+                    and os.path.getmtime(self.path) > boot_time()):
                 return self
             os.remove(self.path)
         with open(self.path, "w") as fh:
             fh.write(str(os.getpid()))
         self.held = True
         return self
+
+    def _holder_alive(self):
+        try:
+            os.kill(int(open(self.path).read().strip()), 0)
+        except ProcessLookupError:
+            return False
+        except (ValueError, OSError):
+            return True  # unreadable or not ours to signal: trust the age check
+        return True
 
     def __exit__(self, *exc):
         if self.held and os.path.exists(self.path):
@@ -102,6 +130,22 @@ def unsynced():
     finally:
         driver.close()
     return [r for r in rows if r["id"] not in in_repo], repo
+
+
+def wait_for_neo4j(timeout=180):
+    """Neo4j takes a while to boot; at login this tick can beat it."""
+    from neo4j import GraphDatabase
+    n4 = jejak.load_config("neo4j")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with GraphDatabase.driver(n4["uri"], auth=(n4["user"], n4["password"])) as d:
+                d.verify_connectivity()
+            return True
+        except Exception:
+            if time.time() >= deadline:
+                return False
+            time.sleep(5)
 
 
 def unpushed(repo):
@@ -172,6 +216,10 @@ def run_once(verbose=False):
                 print("another run is in progress")
             return 0
 
+        # RunAtLoad fires at login, alongside Neo4j's own launch agent.
+        if not wait_for_neo4j():
+            jejak.log_error("jejak-daemon/run", "Neo4j not reachable after 180s; retrying next tick")
+            return 1
         pull(verbose)
         items, repo = unsynced()
         if not items:
