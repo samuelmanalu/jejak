@@ -177,6 +177,9 @@ Claude that the graph is the single interface for knowledge:
 /jejak session [session_id]      Everything from one session
 /jejak stats                     Global stats
 /jejak export [dir] [-a]         Export as Markdown documentation
+/jejak get <memory_id> [--json]  One memory in full, any status
+/jejak delete <memory_id> -r why Soft-delete (hidden everywhere, kept for audit)
+/jejak restore <memory_id>       Bring a deleted memory back as a new entry
 ```
 
 Link knowledge to code with `-f`:
@@ -185,6 +188,44 @@ Link knowledge to code with `-f`:
 jejak save learning "Disbursal uses LAZY fetch to prevent OOM" \
   -f "src/main/java/Disbursal.java"
 ```
+
+### Other AI tools (MCP): Gemini CLI, Antigravity, Cursor, …
+
+`hooks/jejak-mcp.py` is an MCP server with full create/read/update/delete:
+`jejak_save`, `jejak_check_duplicates`, `jejak_ask`, `jejak_search`, `jejak_get`,
+`jejak_links`, `jejak_map`, `jejak_rank`, `jejak_topics`, `jejak_session`,
+`jejak_stats`, `jejak_update`, `jejak_delete`, `jejak_restore`.
+
+Every tool calls `jejak-cli.py`, so redaction, dedup, scoring and the
+supersede/soft-delete rules are the same as in Claude Code. Updates never edit in
+place: `jejak_update` saves a new version that supersedes the old one. Deletes are
+soft. Needs [`uv`](https://docs.astral.sh/uv/), which installs the `mcp` package on
+first run.
+
+Register it in the client's MCP config (same shape for Gemini CLI's
+`~/.gemini/settings.json` and Antigravity's raw MCP config):
+
+```json
+{
+  "mcpServers": {
+    "jejak": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--script", "/Users/<you>/.claude/hooks/jejak-mcp.py"],
+      "env": { "JEJAK_CLIENT": "gemini" }
+    }
+  }
+}
+```
+
+`JEJAK_CLIENT` names the session saves are filed under (`gemini-2026-10-21`).
+`JEJAK_DEFAULT_DIR` sets the project when a call passes no `directory`.
+`JEJAK_PYTHON` points at an interpreter with the `neo4j` driver if auto-detection
+picks the wrong one. Automatic capture (prompt logging, end-of-turn extraction,
+context injection) stays Claude Code only; other clients save when the model
+decides to, guided by the server's instructions.
+
+Whatever a client reads from Jejak goes to that client's model provider. Check that
+your organisation allows that before connecting it.
 
 ### Visualize
 

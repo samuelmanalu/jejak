@@ -25,7 +25,14 @@ Save, search, map, rank, and browse linked knowledge stored in Neo4j. Knowledge 
 /jejak check-duplicates <content>   Check for duplicates and conflicts before saving
 /jejak export [dir] [-a]            Export knowledge as Markdown documentation
 /jejak ask <question>               Answer a question from the knowledge graph
+/jejak get <memory_id> [--json]     Show one memory in full, any status
+/jejak delete <memory_id> -r <why>  Soft-delete (hidden everywhere, kept for audit)
+/jejak restore <memory_id>          Bring a deleted memory back as a new entry
 ```
+
+`delete` is for entries that are plainly wrong or that the user wants gone; to
+correct an entry, use `save ... --supersedes` instead. Same CLI:
+`python3 ~/.claude/hooks/jejak-cli.py get|delete|restore ...`.
 
 ## Question Flow (No Arguments or just `/jejak`)
 

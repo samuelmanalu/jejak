@@ -304,7 +304,8 @@ def cmd_search(args):
                 ORDER BY m.created_at DESC
                 LIMIT 20
                 RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.created_at AS created_at, topics, projects
+                       m.created_at AS created_at, topics, projects,
+                       coalesce(m.superseded, false) AS superseded, m.superseded_by AS superseded_by
             """, search_term=search_term)
 
             result_list = [dict(r) for r in results]
@@ -319,7 +320,11 @@ def cmd_search(args):
                 ts = str(m["created_at"])[:16] if m["created_at"] else ""
                 topics = ", ".join(m["topics"][:3]) if m["topics"] else ""
                 projects = ", ".join(m["projects"]) if m["projects"] else ""
-                print(f"  {m['id'][:8]}  [{m['type']}]  {ts}  project:{projects}")
+                status = ""
+                if m["superseded"]:
+                    status = ("  (DELETED)" if m["superseded_by"] == "deleted"
+                              else f"  (SUPERSEDED by {(m['superseded_by'] or '?')[:8]})")
+                print(f"  {m['id'][:8]}  [{m['type']}]  {ts}  project:{projects}{status}")
                 print(f"    [{topics}] {preview}")
                 print()
     finally:

@@ -112,7 +112,9 @@ def machine_name():
     if sys.platform == "darwin":
         for key in ("HostName", "LocalHostName"):
             try:
-                name = subprocess.run(["scutil", "--get", key], capture_output=True,
+                # Absolute path: MCP clients and launchd start us with a PATH
+                # that lacks /usr/sbin, and the hostname fallback drifts.
+                name = subprocess.run(["/usr/sbin/scutil", "--get", key], capture_output=True,
                                       text=True, timeout=2).stdout.strip()
             except (OSError, subprocess.SubprocessError):
                 name = ""
