@@ -197,7 +197,7 @@ def cmd_map(args):
                     by_type[t] = []
                 by_type[t].append(dict(r))
 
-            type_order = ["decision", "architecture", "convention", "learning", "solution", "finding", "issue", "context", "prompt"]
+            type_order = ["decision", "architecture", "convention", "learning", "solution", "finding", "issue", "context", "artifact", "prompt"]
             for t in type_order:
                 if t not in by_type:
                     continue
@@ -245,15 +245,25 @@ def cmd_session(args):
         with driver.session() as session:
             memories = session.run("""
                 MATCH (m:Memory)-[:IN_SESSION]->(s:Session {session_id: $session_id})
+                WHERE coalesce(m.superseded, false) = false
                 OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
                 OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
                 WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects
                 ORDER BY m.created_at ASC
                 RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.created_at AS created_at, topics, projects
+                       m.created_at AS created_at, m.source_file AS source_file,
+                       m.relevance_score AS score, topics, projects
             """, session_id=session_id)
 
             results = [dict(r) for r in memories]
+
+            if getattr(args, "json", False):
+                import json as _json
+                for r in results:
+                    r["created_at"] = str(r["created_at"]) if r["created_at"] else None
+                print(_json.dumps(results))
+                return
+
             if not results:
                 print(f"No memories found for session {session_id}")
                 return
@@ -587,7 +597,7 @@ def cmd_export(args):
                         by_type[t] = []
                     by_type[t].append(item)
 
-                type_order = ["architecture", "decision", "convention", "learning", "solution", "finding", "issue", "context"]
+                type_order = ["architecture", "decision", "convention", "learning", "solution", "finding", "issue", "context", "artifact"]
                 for t in type_order:
                     if t not in by_type:
                         continue
@@ -725,6 +735,7 @@ def main():
 
     sess_p = subparsers.add_parser("session", help="Show all knowledge from a session")
     sess_p.add_argument("session_id")
+    sess_p.add_argument("--json", action="store_true", help="Output as JSON (machine-readable, e.g. for Seamux)")
 
     search_p = subparsers.add_parser("search", help="Search across all knowledge")
     search_p.add_argument("query", nargs="+")
