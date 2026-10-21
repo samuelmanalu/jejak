@@ -9,6 +9,9 @@ Usage:
   jejak search <query>                Search across all knowledge
   jejak topics [directory]            Show topic clusters for a directory
   jejak links <memory_id>             Show all connections for a memory
+  jejak get <memory_id> [--json]      Show one memory in full (any status)
+  jejak delete <memory_id> [-r why]   Soft-delete a memory (reversible)
+  jejak restore <memory_id>           Bring a deleted memory back as a new entry
   jejak stats                         Show global stats
 
 Types: decision, learning, finding, issue, solution, architecture, convention, context
@@ -52,9 +55,12 @@ def cmd_save(args):
     driver = get_driver()
     try:
         with driver.session() as session:
-            # Global exact-content dedup (reuse a node that exists in any project)
+            # Global exact-content dedup (reuse a node that exists in any project).
+            # Active nodes only: bumping a superseded/deleted twin would leave the
+            # re-saved knowledge invisible (and `restore` relies on re-saving).
             dup_record = session.run("""
                 MATCH (m:Memory) WHERE m.content = $content
+                  AND coalesce(m.superseded, false) = false
                 RETURN m.memory_id AS memory_id LIMIT 1
             """, content=content).single()
 
@@ -718,6 +724,139 @@ def cmd_stats(args):
     finally:
         driver.close()
 
+def _resolve_memory(session, prefix):
+    """Exactly one memory_id for an id or id prefix, or exit with the reason."""
+    if not prefix or len(prefix) < 4:
+        print("Give at least 4 characters of the memory id.")
+        sys.exit(1)
+    ids = [r["id"] for r in session.run(
+        "MATCH (m:Memory) WHERE m.memory_id STARTS WITH $prefix "
+        "RETURN m.memory_id AS id LIMIT 6", prefix=prefix)]
+    if not ids:
+        print(f"No memory found matching '{prefix}'")
+        sys.exit(1)
+    if len(ids) > 1:
+        print(f"'{prefix}' is ambiguous: {', '.join(i[:12] for i in ids)} — use more characters.")
+        sys.exit(1)
+    return ids[0]
+
+def _memory_details(session, memory_id):
+    rec = session.run("""
+        MATCH (m:Memory {memory_id: $id})
+        OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
+        OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
+        OPTIONAL MATCH (m)-[:IN_SESSION]->(s:Session)
+        OPTIONAL MATCH (older:Memory {superseded_by: m.memory_id})
+        WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.path) AS project_paths,
+             collect(DISTINCT p.name) AS projects, count(DISTINCT s) AS sessions,
+             collect(DISTINCT older.memory_id) AS supersedes
+        RETURN m {.*} AS m, topics, project_paths, projects, sessions, supersedes
+    """, id=memory_id).single()
+    m = dict(rec["m"])
+    for k, v in list(m.items()):
+        if hasattr(v, "iso_format"):
+            m[k] = v.iso_format()
+    if not m.get("superseded"):
+        status = "active"
+    elif m.get("superseded_by") == "deleted":
+        status = "deleted"
+    else:
+        status = "superseded"
+    return {
+        "memory_id": m.get("memory_id"), "type": m.get("type"), "status": status,
+        "content": m.get("content"), "source_file": m.get("source_file"),
+        "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
+        "machine_name": m.get("machine_name"),
+        "relevance_score": m.get("relevance_score"), "hit_count": m.get("hit_count"),
+        "superseded_at": m.get("superseded_at"), "superseded_by": m.get("superseded_by"),
+        "deleted_reason": m.get("deleted_reason"), "restored_from": m.get("restored_from"),
+        "supersedes": rec["supersedes"], "topics": sorted(rec["topics"]),
+        "projects": sorted(rec["projects"]), "project_paths": sorted(rec["project_paths"]),
+        "sessions": rec["sessions"],
+    }
+
+def cmd_get(args):
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            d = _memory_details(session, _resolve_memory(session, args.memory_id))
+    finally:
+        driver.close()
+    if args.json:
+        print(json.dumps(d))
+        return
+    print(f"=== {d['memory_id']} ===")
+    print(f"    [{d['type']}] {d['status'].upper()}  score:{d['relevance_score'] or 0:.0f}  "
+          f"hits:{d['hit_count'] or 0}  sessions:{d['sessions']}")
+    print(f"    created:{str(d['created_at'])[:19]}  updated:{str(d['updated_at'])[:19]}  machine:{d['machine_name']}")
+    print(f"    projects:{', '.join(d['projects'])}  topics:{', '.join(d['topics'])}")
+    if d["source_file"]:
+        print(f"    file:{d['source_file']}")
+    if d["status"] == "superseded":
+        print(f"    superseded by {d['superseded_by'][:8]} at {str(d['superseded_at'])[:19]}")
+    if d["status"] == "deleted":
+        print(f"    deleted at {str(d['superseded_at'])[:19]}: {d['deleted_reason'] or '(no reason)'}")
+    if d["supersedes"]:
+        print(f"    supersedes: {', '.join(i[:8] for i in d['supersedes'])}")
+    if d["restored_from"]:
+        print(f"    restored from: {d['restored_from'][:8]}")
+    print()
+    print(d["content"])
+
+def cmd_delete(args):
+    """Soft delete. Marks the memory superseded by 'deleted', which every active
+    view already hides and jejak-sync carries monotonically to other machines.
+    Nothing is removed from Neo4j; `restore` brings the content back."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            memory_id = _resolve_memory(session, args.memory_id)
+            d = _memory_details(session, memory_id)
+            if d["status"] != "active":
+                print(f"Not deleted: {memory_id[:8]} is already {d['status']}.")
+                sys.exit(1)
+            session.run("""
+                MATCH (m:Memory {memory_id: $id})
+                SET m.superseded = true, m.superseded_at = datetime(),
+                    m.superseded_by = 'deleted', m.deleted_reason = $reason,
+                    m.updated_at = datetime()
+            """, id=memory_id, reason=jejak.redact(args.reason or ""))
+    finally:
+        driver.close()
+    print(f"Deleted [{d['type']}] id:{memory_id[:8]} (soft; restore with: jejak restore {memory_id[:8]})")
+
+def cmd_restore(args):
+    """Bring a deleted memory back as a NEW active entry (restored_from = old id).
+    Un-setting `superseded` in place would be undone by the next sync, because
+    jejak-sync treats superseded as monotonic."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            old_id = _resolve_memory(session, args.memory_id)
+            d = _memory_details(session, old_id)
+    finally:
+        driver.close()
+    if d["status"] == "active":
+        print(f"Nothing to restore: {old_id[:8]} is active.")
+        sys.exit(1)
+    if d["status"] == "superseded":
+        print(f"{old_id[:8]} was superseded by {d['superseded_by'][:8]}, not deleted. To make it current again, "
+              f"save its content with --supersedes {d['superseded_by'][:8]} so only one version stays active.")
+        sys.exit(1)
+    directory = args.directory or (d["project_paths"][0] if d["project_paths"] else os.getcwd())
+    cmd_save(argparse.Namespace(type=d["type"], content=[d["content"]], directory=directory,
+                                session=args.session, file=d["source_file"], supersedes=None))
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            session.run("""
+                MATCH (m:Memory) WHERE m.content = $content AND m.memory_id <> $old
+                  AND coalesce(m.superseded, false) = false
+                SET m.restored_from = $old
+            """, content=jejak.redact(d["content"]), old=old_id)
+    finally:
+        driver.close()
+
 def main():
     parser = argparse.ArgumentParser(description="Jejak CLI")
     subparsers = parser.add_subparsers(dest="command")
@@ -764,6 +903,19 @@ def main():
     ask_p.add_argument("question", nargs="+")
     ask_p.add_argument("-d", "--directory", help="Project directory (default: cwd)")
 
+    get_p = subparsers.add_parser("get", help="Show one memory in full (any status)")
+    get_p.add_argument("memory_id", help="Memory ID (full or prefix)")
+    get_p.add_argument("--json", action="store_true", help="Output as JSON")
+
+    del_p = subparsers.add_parser("delete", help="Soft-delete a memory (reversible with restore)")
+    del_p.add_argument("memory_id", help="Memory ID (full or prefix)")
+    del_p.add_argument("-r", "--reason", help="Why it is being deleted")
+
+    res_p = subparsers.add_parser("restore", help="Bring a deleted memory back as a new active entry")
+    res_p.add_argument("memory_id", help="Memory ID (full or prefix)")
+    res_p.add_argument("-d", "--directory", help="Project directory (default: the memory's own project)")
+    res_p.add_argument("-s", "--session", help="Session ID (default: from env or 'manual')")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -781,6 +933,9 @@ def main():
         "check-duplicates": cmd_check_duplicates,
         "export": cmd_export,
         "ask": cmd_ask,
+        "get": cmd_get,
+        "delete": cmd_delete,
+        "restore": cmd_restore,
     }
     commands[args.command](args)
 
