@@ -251,6 +251,12 @@ viewer only reads, and every link stays in Neo4j for ranking, `links` and `ask`.
 graph is rebuilt only when the knowledge changes, so the page's 10-second refresh
 stays cheap.
 
+The map is static. The layout runs once (seconds, in the background, even if the tab
+is hidden), then stops and is remembered in the browser, so reopening the page shows
+the same map instantly. New knowledge appears next to a linked bubble without
+disturbing the rest. A dragged bubble stays where you drop it. Press `L` to lay the
+map out again.
+
 ### Bonus: `/recap`
 
 A companion skill that fuses the graph, the prompt log, and your git commits into a

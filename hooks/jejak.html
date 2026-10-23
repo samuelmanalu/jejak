@@ -637,8 +637,10 @@
 
   // ===== SIZING =====
   function nodeRadius(n) {
-    const base = n.type === 'prompt' ? 4 : 6;
-    return base + Math.min(n.connections * 1.5, 12);
+    // sqrt keeps sizes distinguishable: with linear growth nearly every linked
+    // memory hit the cap, and thousands of max-size bubbles stacked up.
+    const base = n.type === 'prompt' ? 4 : 5;
+    return base + Math.min(Math.sqrt(n.connections) * 1.6, MAX_RADIUS - 5);
   }
 
   // ===== INIT POSITIONS =====
@@ -653,34 +655,166 @@
   }
 
   // ===== PHYSICS =====
-  const REPULSION = 800;
-  const SPRING_K = 0.008;
+  const REPULSION = 1500;
+  const SPRING_K = 0.1;       // per link, divided by degree below
   const SPRING_REST = 80;
-  const CENTER_GRAVITY = 0.01;
-  const DAMPING = 0.88;
+  const CENTER_GRAVITY = 0.003;
+  const MAX_STEP = 40;
+  const MAX_RADIUS = 13;        // largest bubble nodeRadius() can return
+  const COLLIDE_PAD = 2;        // gap kept between bubbles
+  const COLLIDE_STRENGTH = 0.7;
+  const COLLIDE_PASSES = 3;
+  const DAMPING = 0.6;         // d3-force default velocity decay
   const DT = 1;
+
+  // ===== COOLING: the layout settles once, then stays still =====
+  // `alpha` is the layout's temperature. It decays every frame and the physics
+  // stops below ALPHA_MIN, so bubbles come to rest instead of drifting forever.
+  // `movable` limits which nodes may move: null = all (a full layout), a Set =
+  // only those ids (newly arrived knowledge), so the rest of the map stays put.
+  const ALPHA_DECAY = 0.95;
+  const ALPHA_MIN = 0.005;
+  const LAYOUT_KEY = 'jejak-layout-v2';   // v1 layouts could be exploded; ignore them
+  const LAYOUT_LIMIT = 1e6;               // a saved layout wider than this is broken
+  let alpha = 0;              // the first data load decides what moves
+  let movable = new Set();
+
+  function canMove(n) {
+    return n !== draggedNode && (movable === null || movable.has(n.id));
+  }
+
+  function loadLayout() {
+    try {
+      localStorage.removeItem('jejak-layout-v1');
+      const pos = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}');
+      const sane = Object.values(pos).every(p => Array.isArray(p) &&
+        Math.abs(p[0]) < LAYOUT_LIMIT && Math.abs(p[1]) < LAYOUT_LIMIT);
+      return sane ? pos : {};
+    } catch (_) { return {}; }
+  }
+
+  function saveLayout() {
+    try {
+      const pos = {};
+      NODES.forEach(n => { pos[n.id] = [Math.round(n.x), Math.round(n.y)]; });
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(pos));
+    } catch (_) { /* private window or full storage: the layout just isn't remembered */ }
+  }
+
+  function settle() {
+    alpha = 0;
+    movable = new Set();
+    NODES.forEach(n => { n.vx = 0; n.vy = 0; });
+    saveLayout();
+  }
+
+  function relayout() {
+    movable = null;
+    alpha = 1;
+    kickLayout();
+  }
+
+  // ===== Barnes-Hut repulsion =====
+  // Pairwise repulsion is O(n^2): with thousands of memories one frame took
+  // seconds and froze the tab. A quadtree lets a distant cluster push as one
+  // body, O(n log n).
+  const THETA2 = 0.81;      // theta 0.9: a cell this small relative to its distance counts as one body
+  const MAX_DEPTH = 24;     // coincident points share a leaf instead of splitting forever
+
+  function bhCell(x0, y0, size) {
+    return { x0, y0, size, pts: [], kids: null, mass: 0, cx: 0, cy: 0 };
+  }
+
+  function bhInsert(cell, n, depth) {
+    while (true) {
+      if (!cell.kids) {
+        if (cell.pts.length === 0 || depth >= MAX_DEPTH) { cell.pts.push(n); return; }
+        const h = cell.size / 2;
+        cell.kids = [bhCell(cell.x0, cell.y0, h), bhCell(cell.x0 + h, cell.y0, h),
+                     bhCell(cell.x0, cell.y0 + h, h), bhCell(cell.x0 + h, cell.y0 + h, h)];
+        const old = cell.pts; cell.pts = [];
+        old.forEach(p => bhInsert(cell, p, depth));
+      }
+      const h = cell.size / 2;
+      cell = cell.kids[(n.x >= cell.x0 + h ? 1 : 0) + (n.y >= cell.y0 + h ? 2 : 0)];
+      depth++;
+    }
+  }
+
+  function bhMass(cell) {
+    const pts = cell.pts, kids = cell.kids;
+    let m = 0, cx = 0, cy = 0;
+    if (!kids) {
+      for (let i = 0; i < pts.length; i++) { cx += pts[i].x; cy += pts[i].y; }
+      m = pts.length;
+    } else {
+      for (let i = 0; i < 4; i++) {
+        const k = kids[i];
+        bhMass(k);
+        m += k.mass; cx += k.cx * k.mass; cy += k.cy * k.mass;
+      }
+    }
+    cell.mass = m;
+    if (m) { cell.cx = cx / m; cell.cy = cy / m; }
+  }
+
+  // Hot path: plain loops and an explicit stack (no closures, no recursion).
+  const bhStack = [];
+  function bhRepel(n, root) {
+    const nx = n.x, ny = n.y;
+    let fx = 0, fy = 0;
+    bhStack.length = 0;
+    bhStack.push(root);
+    while (bhStack.length) {
+      const cell = bhStack.pop();
+      if (!cell.mass) continue;
+      if (!cell.kids) {
+        const pts = cell.pts;
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i];
+          if (p === n) continue;
+          const dx = p.x - nx, dy = p.y - ny;
+          let d2 = dx * dx + dy * dy;
+          if (d2 < 1) d2 = 1;
+          const f = REPULSION / (d2 * Math.sqrt(d2));
+          fx -= dx * f; fy -= dy * f;
+        }
+        continue;
+      }
+      const dx = cell.cx - nx, dy = cell.cy - ny;
+      let d2 = dx * dx + dy * dy;
+      if (d2 > 0 && cell.size * cell.size < THETA2 * d2) {
+        if (d2 < 1) d2 = 1;
+        const f = REPULSION * cell.mass / (d2 * Math.sqrt(d2));
+        fx -= dx * f; fy -= dy * f;
+      } else {
+        const k = cell.kids;
+        bhStack.push(k[0], k[1], k[2], k[3]);
+      }
+    }
+    n.vx += fx;
+    n.vy += fy;
+  }
 
   function simulate() {
     const nodes = NODES;
     const edges = EDGES;
-    // Repulsion (Barnes-Hut would be better for 1000+ nodes, but ~46 is fine with O(n^2))
-    for (let i = 0; i < nodes.length; i++) {
-      if (nodes[i] === draggedNode) continue;
-      for (let j = i + 1; j < nodes.length; j++) {
-        if (nodes[j] === draggedNode) continue;
-        let dx = nodes[j].x - nodes[i].x;
-        let dy = nodes[j].y - nodes[i].y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1) d2 = 1;
-        const d = Math.sqrt(d2);
-        const f = REPULSION / d2;
-        const fx = (dx / d) * f;
-        const fy = (dy / d) * f;
-        nodes[i].vx -= fx;
-        nodes[i].vy -= fy;
-        nodes[j].vx += fx;
-        nodes[j].vy += fy;
-      }
+    const movers = movable === null ? nodes : nodes.filter(canMove);
+    // Layout forces (repulsion, springs, gravity) are scaled by the cooling
+    // temperature below; remember the velocity they start from.
+    movers.forEach(n => { n._vx = n.vx; n._vy = n.vy; });
+
+    // Repulsion on the nodes that may move, from every node.
+    if (movers.length && nodes.length > 1) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      nodes.forEach(n => {
+        if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y;
+        if (n.x > maxX) maxX = n.x; if (n.y > maxY) maxY = n.y;
+      });
+      const root = bhCell(minX, minY, Math.max(maxX - minX, maxY - minY, 1) + 1);
+      nodes.forEach(n => bhInsert(root, n, 0));
+      bhMass(root);
+      movers.forEach(m => bhRepel(m, root));
     }
 
     // Springs
@@ -692,25 +826,73 @@
       let dy = t.y - s.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
       const stretch = d - SPRING_REST;
-      const k = SPRING_K * (e.strength || 1);
+      // Divide by the smaller degree (as d3-force does): a hub with dozens of
+      // links would otherwise be yanked by all of them at full strength,
+      // overshoot, and swing wider every step until the layout explodes.
+      const k = SPRING_K * (e.strength || 1) / Math.max(1, Math.min(s.connections || 1, t.connections || 1));
       const fx = (dx / d) * stretch * k;
       const fy = (dy / d) * stretch * k;
-      if (s !== draggedNode) { s.vx += fx; s.vy += fy; }
-      if (t !== draggedNode) { t.vx -= fx; t.vy -= fy; }
+      if (canMove(s)) { s.vx += fx; s.vy += fy; }
+      if (canMove(t)) { t.vx -= fx; t.vy -= fy; }
     });
 
     // Center gravity
-    nodes.forEach(n => {
-      if (n === draggedNode) return;
+    movers.forEach(n => {
       n.vx -= n.x * CENTER_GRAVITY;
       n.vy -= n.y * CENTER_GRAVITY;
     });
 
-    // Integrate
+    // Cool the layout forces (as d3-force does with alpha). Collision below is
+    // NOT cooled, so overlaps keep being resolved to the very end.
+    movers.forEach(n => {
+      n.vx = n._vx + (n.vx - n._vx) * alpha;
+      n.vy = n._vy + (n.vy - n._vy) * alpha;
+    });
+
+    // Collision: bubbles closer than their radii (+ padding) push apart, so the
+    // settled map has no stacked bubbles. A grid keeps it O(n).
+    // Like d3's forceCollide it works on where each bubble is about to be
+    // (x + vx), and runs several passes per step so a dense core spreads out.
+    if (movers.length) {
+      const cell = 2 * MAX_RADIUS + COLLIDE_PAD;
+      nodes.forEach(n => { n._r = nodeRadius(n); });
+      for (let pass = 0; pass < COLLIDE_PASSES; pass++) {
+        const grid = new Map();
+        nodes.forEach(n => {
+          const key = Math.floor((n.x + n.vx) / cell) * 73856093 ^ Math.floor((n.y + n.vy) / cell) * 19349663;
+          const bucket = grid.get(key);
+          if (bucket) bucket.push(n); else grid.set(key, [n]);
+        });
+        movers.forEach(m => {
+          const mx = m.x + m.vx, my = m.y + m.vy;
+          const gx = Math.floor(mx / cell), gy = Math.floor(my / cell);
+          for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+            const bucket = grid.get((gx + i) * 73856093 ^ (gy + j) * 19349663);
+            if (!bucket) continue;
+            for (let k = 0; k < bucket.length; k++) {
+              const o = bucket[k];
+              if (o === m) continue;
+              let dx = mx - (o.x + o.vx), dy = my - (o.y + o.vy);
+              let d = Math.sqrt(dx * dx + dy * dy);
+              const min = m._r + o._r + COLLIDE_PAD;
+              if (d >= min) continue;
+              if (d < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d = Math.sqrt(dx * dx + dy * dy); }
+              const push = (min - d) / d * COLLIDE_STRENGTH;
+              m.vx += dx * push; m.vy += dy * push;
+            }
+          }
+        });
+      }
+    }
+
+    // Integrate. Fixed nodes never move, and no node jumps more than MAX_STEP
+    // in one step (a safety net against any force spike).
     nodes.forEach(n => {
-      if (n === draggedNode) return;
+      if (!canMove(n)) { n.vx = 0; n.vy = 0; return; }
       n.vx *= DAMPING;
       n.vy *= DAMPING;
+      const speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+      if (speed > MAX_STEP) { n.vx *= MAX_STEP / speed; n.vy *= MAX_STEP / speed; }
       n.x += n.vx * DT;
       n.y += n.vy * DT;
     });
@@ -970,6 +1152,7 @@
       }
       openSidebar(draggedNode);
       draggedNode = null;
+      saveLayout();   // a dropped bubble stays where it was put
     } else if (isDragging) {
       isDragging = false;
       // If barely moved, treat as click on background to deselect
@@ -1041,7 +1224,7 @@
   }, { passive: false });
 
   canvas.addEventListener('touchend', e => {
-    if (draggedNode) { openSidebar(draggedNode); draggedNode = null; }
+    if (draggedNode) { openSidebar(draggedNode); draggedNode = null; saveLayout(); }
     isDragging = false;
     lastTouchDist = 0;
   });
@@ -1057,12 +1240,45 @@
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') { closeSidebar(); searchInput.blur(); searchQuery = ''; searchInput.value = ''; }
     if (e.key === '/' && document.activeElement !== searchInput) { e.preventDefault(); searchInput.focus(); }
+    if ((e.key === 'l' || e.key === 'L') && document.activeElement !== searchInput) relayout();
   });
 
   // ===== LOOP =====
+  // Redraw only while something changes: the layout settling, the user
+  // interacting (hover, pan, zoom, drag, filters, search), or new data.
+  // A settled, untouched map costs nothing.
+  let lastActivity = performance.now();
+  function markActive() { lastActivity = performance.now(); }
+  ['mousemove', 'mousedown', 'mouseup', 'wheel', 'touchstart', 'touchmove', 'touchend',
+   'keydown', 'input', 'change', 'click', 'resize'].forEach(ev =>
+    window.addEventListener(ev, markActive, { capture: true, passive: true }));
+
+  // The layout runs in ~30 ms chunks driven by a MessageChannel, not by
+  // animation frames: browsers pause requestAnimationFrame in hidden tabs, which
+  // left a layout half-done whenever you looked away. Chunks keep the page
+  // responsive and finish in seconds whether or not the tab is visible.
+  const layoutChannel = new MessageChannel();
+  let layoutRunning = false;
+  layoutChannel.port1.onmessage = () => {
+    const start = performance.now();
+    while (alpha >= ALPHA_MIN && performance.now() - start < 30) {
+      simulate();
+      alpha *= ALPHA_DECAY;
+      if (alpha < ALPHA_MIN) settle();
+    }
+    markActive();
+    if (alpha >= ALPHA_MIN) layoutChannel.port2.postMessage(0);
+    else layoutRunning = false;
+  };
+  function kickLayout() {
+    if (alpha >= ALPHA_MIN && !layoutRunning) {
+      layoutRunning = true;
+      layoutChannel.port2.postMessage(0);
+    }
+  }
+
   function loop() {
-    simulate();
-    draw();
+    if (layoutRunning || performance.now() - lastActivity < 600) draw();
     requestAnimationFrame(loop);
   }
 
@@ -1090,14 +1306,44 @@
     EDGES = data.edges || [];
     rebuildIndices();
 
+    // Positions: this page's own (refresh), else the remembered layout, else new.
+    const saved = isFirstLoad ? loadLayout() : {};
+    const fresh = [];
     NODES.forEach(n => {
-      const p = prevPos.get(n.id);
-      if (p) { n.x = p.x; n.y = p.y; n.vx = p.vx; n.vy = p.vy; }
-      else {
-        const a = Math.random() * Math.PI * 2, r = 100 + Math.random() * 200;
-        n.x = Math.cos(a) * r; n.y = Math.sin(a) * r; n.vx = 0; n.vy = 0;
-      }
+      const p = prevPos.get(n.id) || (saved[n.id] && { x: saved[n.id][0], y: saved[n.id][1] });
+      n.vx = 0; n.vy = 0;
+      if (p) { n.x = p.x; n.y = p.y; }
+      else fresh.push(n);
     });
+    // What may move: everything on a first-ever layout (or when most of the
+    // map is new), only the new bubbles otherwise, nothing if nothing is new.
+    // A full layout already running keeps running.
+    const fullLayout = fresh.length > NODES.length / 2 || (movable === null && alpha >= ALPHA_MIN);
+    const freshIds = new Set(fresh.map(n => n.id));
+    const anchorOf = new Map();
+    if (!fullLayout) {
+      EDGES.forEach(e => {
+        if (freshIds.has(e.source) && !freshIds.has(e.target) && !anchorOf.has(e.source)) anchorOf.set(e.source, e.target);
+        if (freshIds.has(e.target) && !freshIds.has(e.source) && !anchorOf.has(e.target)) anchorOf.set(e.target, e.source);
+      });
+    }
+    // Unanchored bubbles start on a disc sized to the map, not crammed into a
+    // fixed ring: thousands of overlapping starts give huge first-step forces.
+    // Radius ~25*sqrt(n) holds every bubble with room to spare, so collision
+    // only has to tidy, not un-stack thousands of starts.
+    const spread = Math.max(300, 25 * Math.sqrt(NODES.length));
+    fresh.forEach(n => {
+      // Start a new bubble beside something it links to, so it settles nearby.
+      const anchor = nodeMap.get(anchorOf.get(n.id));
+      const a = Math.random() * Math.PI * 2;
+      const r = anchor ? 20 + Math.random() * 30 : Math.sqrt(Math.random()) * spread;
+      n.x = (anchor ? anchor.x : 0) + Math.cos(a) * r;
+      n.y = (anchor ? anchor.y : 0) + Math.sin(a) * r;
+    });
+
+    if (fullLayout) { movable = null; if (alpha < ALPHA_MIN) alpha = 1; }
+    else if (fresh.length) { movable = freshIds; alpha = 0.5; }
+    else if (isFirstLoad) settle();
 
     if (isFirstLoad) {
       visibleTypes = new Set(allTypes);
@@ -1112,6 +1358,8 @@
     updateStats();
     // If the currently selected node vanished, close its sidebar.
     if (selectedNodeId && !nodeMap.has(selectedNodeId)) closeSidebar();
+    markActive();   // repaint once for the new data even if nobody is touching the page
+    kickLayout();   // place new bubbles (no-op when nothing needs to move)
   }
 
   function showMessage(msg) {
