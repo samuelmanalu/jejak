@@ -244,6 +244,13 @@ python3 ~/.claude/hooks/serve-graph.py     # http://127.0.0.1:8787
 A force-directed canvas graph — colour by type, filter by project, click to inspect.
 Bound to loopback only. Neo4j Browser at `http://localhost:7474` also works.
 
+Every active memory is drawn, but each brings only its 10 strongest links
+(`JEJAK_GRAPH_EDGES_PER_NODE` to change it). Topic linking makes the stored graph
+nearly complete, far more than a browser can draw. The trimming is display-only: the
+viewer only reads, and every link stays in Neo4j for ranking, `links` and `ask`. The
+graph is rebuilt only when the knowledge changes, so the page's 10-second refresh
+stays cheap.
+
 ### Bonus: `/recap`
 
 A companion skill that fuses the graph, the prompt log, and your git commits into a

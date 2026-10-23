@@ -7,6 +7,13 @@ directory — including db-config.json with plaintext DB passwords — on all ne
 interfaces. This server:
   - binds to 127.0.0.1 only (not reachable from other machines)
   - serves exactly one file, ignoring every other path
+
+The view is READ-ONLY and trims only what the page receives, never the graph:
+every active memory is sent, but each one brings only its strongest
+EDGES_PER_NODE links (by shared-topic strength, then the neighbour's score).
+Topic linking makes the stored graph nearly complete (1.9M links for 6k
+memories), which no browser can draw. All links stay in Neo4j for ranking,
+`links` and `ask`.
 """
 import http.server
 import json
@@ -18,16 +25,42 @@ sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
 HOST = "127.0.0.1"
 PORT = 8787
 HTML_PATH = os.path.expanduser("~/.claude/hooks/jejak.html")
+EDGES_PER_NODE = int(os.environ.get("JEJAK_GRAPH_EDGES_PER_NODE", "10"))
+
+# The page polls every 10 s and the edge query takes seconds, so the graph is
+# rebuilt only when this cheap fingerprint of the knowledge changes.
+SIGNATURE_QUERY = """
+    MATCH (m:Memory)
+    RETURN count(m) AS n, toString(max(m.updated_at)) AS updated,
+           sum(coalesce(m.hit_count, 1)) AS hits,
+           round(sum(coalesce(m.relevance_score, 0.0))) AS score,
+           sum(CASE WHEN coalesce(m.superseded, false) THEN 1 ELSE 0 END) AS inactive
+"""
+
+EDGES_QUERY = """
+    MATCH (a:Memory)-[r:RELATES_TO]-(b:Memory)
+    WHERE coalesce(a.superseded, false) = false AND coalesce(b.superseded, false) = false
+    WITH a, b, coalesce(r.strength, 1) AS strength
+    ORDER BY strength DESC, coalesce(b.relevance_score, 0.0) DESC
+    WITH a, collect({target: left(b.memory_id, 8), strength: strength})[..$k] AS top
+    UNWIND top AS t
+    RETURN left(a.memory_id, 8) AS source, t.target AS target, t.strength AS strength
+"""
+
+_cache = {"signature": None, "data": None}
 
 
 def live_graph():
-    """Query Neo4j for the current nodes + edges. Returns a JSON-able dict."""
+    """Current nodes + trimmed edges as a JSON-able dict (cached until the knowledge changes)."""
     import jejak_common as jejak
     from neo4j import GraphDatabase
     cfg = jejak.load_config("neo4j")
     driver = GraphDatabase.driver(cfg["uri"], auth=(cfg["user"], cfg["password"]))
     try:
         with driver.session() as s:
+            signature = tuple(s.run(SIGNATURE_QUERY).single().values())
+            if signature == _cache["signature"]:
+                return _cache["data"]
             nodes = [dict(r) for r in s.run("""
                 MATCH (m:Memory)
                 WHERE coalesce(m.superseded, false) = false
@@ -43,12 +76,15 @@ def live_graph():
                        topics, projects,
                        [x IN sessions | left(x, 8)] AS sessions
             """)]
-            edges = [dict(r) for r in s.run("""
-                MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory)
-                RETURN left(a.memory_id, 8) AS source, left(b.memory_id, 8) AS target,
-                       coalesce(r.strength, 1) AS strength
-            """)]
-        return {"nodes": nodes, "edges": edges}
+            # Each memory's top-k, merged: a link chosen from both ends is sent once.
+            strongest = {}
+            for r in s.run(EDGES_QUERY, k=EDGES_PER_NODE):
+                pair = (r["source"], r["target"]) if r["source"] < r["target"] else (r["target"], r["source"])
+                strongest[pair] = max(strongest.get(pair, 0), r["strength"])
+            edges = [{"source": a, "target": b, "strength": st} for (a, b), st in strongest.items()]
+        data = {"nodes": nodes, "edges": edges}
+        _cache["signature"], _cache["data"] = signature, data
+        return data
     finally:
         driver.close()
 
