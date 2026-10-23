@@ -1,14 +1,21 @@
 # Jejak
 
-**Persistent, self-ranking memory for [Claude Code](https://claude.com/claude-code).**
+**Persistent, self-ranking memory for AI coding agents: [Claude Code](https://claude.com/claude-code),
+and any MCP client such as Gemini CLI, Antigravity or Cursor.**
 
 *Jejak* is Indonesian for *trail* — the trail of everything you and your AI assistant
 worked out together, so the next session doesn't start from zero.
 
-Claude Code forgets everything when a session ends. Jejak hooks into the session
-lifecycle, extracts the decisions and root causes worth keeping, stores them as a
-graph in Neo4j, and loads the most relevant ones back into context automatically the
-next time you open a terminal in that project.
+AI coding agents forget everything when a session ends. Jejak stores the decisions and
+root causes worth keeping as a graph in Neo4j and brings the most relevant ones back
+the next time you work in that project, whichever agent you use.
+
+- **Claude Code** gets the full, automatic version: Jejak hooks into the session
+  lifecycle, extracts what was learned, and loads it back into context on its own.
+- **Any MCP client** (Gemini CLI, Antigravity, Cursor, …) gets the same graph through
+  the [MCP server](#other-ai-tools-mcp-gemini-cli-antigravity-cursor-), with full
+  create/read/update/delete. There the agent saves and looks up knowledge when it
+  decides to, guided by the server's rules.
 
 No manual note-taking. No `NOTES.md` that goes stale. The graph decides what matters
 by scoring what you actually keep coming back to.
@@ -26,6 +33,7 @@ by scoring what you actually keep coming back to.
 | **Deduplicates semantically** | Before saving, a conflict-pruning pass compares against existing knowledge: duplicates are dropped, contradictions mark the old entry `superseded` (reversibly). |
 | **Indexes your documents** | Markdown, PDFs, spreadsheets, notebooks and published artifacts are captured automatically and made searchable. |
 | **Redacts secrets** | Tokens, API keys, passwords and connection strings are scrubbed *before* anything is written to disk. |
+| **Works beyond Claude** | An MCP server exposes the same graph to Gemini CLI, Antigravity, Cursor and other MCP clients, so knowledge saved in one agent is there in the next. |
 
 ---
 
