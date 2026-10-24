@@ -69,8 +69,15 @@ def save_config(cfg):
 
 
 def is_loopback_url(url):
+    """True only for this machine: localhost or a loopback IP (not 127.evil.com)."""
+    import ipaddress
     host = urllib.parse.urlparse(url).hostname or ""
-    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def check_server_url(url, insecure=False):
@@ -115,6 +122,8 @@ def request(method, path, body=None, timeout=30, auth=True, cfg=None, server=Non
     if not server:
         raise ClientError("Not connected to a Jejak server.",
                           "jejak login <server-url>   (a local install uses http://127.0.0.1:7700)")
+    # --insecure counts only for the exact server it was given for.
+    server = check_server_url(server, insecure=cfg.get("insecure_for") == server.rstrip("/"))
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "User-Agent": "jejak-client/1"}
     if auth:

@@ -12,11 +12,14 @@ import json
 from datetime import date
 
 import anyio
+import time
+
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
-from . import auth, core
+from . import auth, core, oauth
 from .config import driver
 
 TYPES = ("decision", "learning", "finding", "issue", "solution", "architecture", "convention", "context")
@@ -42,11 +45,29 @@ INSTRUCTIONS = """Jejak is the user's (and their team's) engineering knowledge g
   employer work, server addresses, security setup, credentials or personal data.
 - Never save secrets, trivial file reads, or conversational filler."""
 
-# Bearer auth is checked on every request (below), so the SDK's localhost-only
-# Host check would only block real deployments behind a domain.
-mcp = FastMCP("jejak", instructions=INSTRUCTIONS, stateless_http=True, json_response=True,
-              streamable_http_path="/mcp",
-              transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+# Sign-in: a client needs only the URL. On its first call it gets 401 with a
+# pointer to this server's OAuth metadata, opens the browser on our consent
+# page, and receives short-lived tokens (see oauth.py). Personal access tokens
+# (jjk_) keep working for scripts and clients without OAuth.
+# Bearer auth is checked on every request, so the SDK's localhost-only Host
+# check would only block real deployments behind a domain.
+mcp = FastMCP(
+    "jejak", instructions=INSTRUCTIONS, stateless_http=True, json_response=True,
+    streamable_http_path="/mcp",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    auth_server_provider=oauth.JejakOAuthProvider(),
+    auth=AuthSettings(
+        issuer_url=oauth.public_url(),
+        resource_server_url=oauth.resource_url(),
+        validate_token_resource=False,   # every token this server accepts is issued for /mcp only
+        # Not required_scopes: the SDK publishes it as the resource's scopes_supported and
+        # clients then ask for only that. Every token carries jejak:read anyway.
+        required_scopes=None,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=list(auth.SCOPES), default_scopes=oauth.DEFAULT_SCOPES),
+        revocation_options=RevocationOptions(enabled=True),
+    ),
+)
 
 
 def _principal(ctx: Context):
@@ -233,32 +254,48 @@ async def jejak_restore(ctx: Context, memory_id: str) -> str:
     return await _run(ctx, "restore", {"memory_id": memory_id})
 
 
+# Requests per client address per minute on the sign-in endpoints. Codes and
+# tokens are 256-bit random, so this is about load and noise, not guessing.
+# Per network (an IPv6 /64 is one network) and, so rotating addresses does not
+# help, a server-wide ceiling per path.
+LIMITS = {"/register": 10, "/token": 60, "/authorize": 30, "/revoke": 30}
+GLOBAL_LIMITS = {"/register": 200, "/token": 3000, "/authorize": 600, "/revoke": 600}
+_hits = {}
+
+
+def _count(key, limit, now):
+    recent = [t for t in _hits.get(key, []) if now - t < 60]
+    recent.append(now)
+    _hits[key] = recent
+    return len(recent) > limit
+
+
+def _limited(path, addr):
+    limit = LIMITS.get(path)
+    if not limit:
+        return False
+    now = time.time()
+    if len(_hits) > 50_000:
+        _hits.clear()
+    over_net = _count((path, auth.net_of(addr)), limit, now)
+    over_all = _count((path, "*"), GLOBAL_LIMITS[path], now)
+    return over_net or over_all
+
+
 def mcp_asgi():
-    """The MCP app behind a bearer-token check, so unauthenticated calls stop
-    at the door with a clear 401 instead of reaching any tool."""
+    """MCP plus the OAuth endpoints, with rate limits on the sign-in endpoints."""
+    mcp._session_manager = None   # a fresh session manager per app (it can run only once)
     inner = mcp.streamable_http_app()
 
     async def app(scope, receive, send):
-        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
-            headers = dict(scope.get("headers") or [])
-            header = headers.get(b"authorization", b"").decode("latin-1")
-            token = header[7:].strip() if header.lower().startswith("bearer ") else ""
-
-            def check():
-                with driver().session() as s:
-                    auth.authenticate(s, token)
-            try:
-                await anyio.to_thread.run_sync(check)
-            except auth.AuthError as e:
-                resp = JSONResponse({"error": str(e), "hint": "Send Authorization: Bearer <token>. "
-                                     "Create one with: jejak token create mcp"},
-                                    status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        if scope["type"] == "http":
+            path = scope["path"].rstrip("/") or "/"
+            addr = (scope.get("client") or ("?",))[0]
+            if _limited(path, addr):
+                resp = JSONResponse({"error": "slow_down", "error_description": "Too many requests; wait a minute."},
+                                    status_code=429, headers={"Retry-After": "60"})
                 await resp(scope, receive, send)
                 return
-        elif scope["type"] == "http":
-            resp = JSONResponse({"error": "Not found."}, status_code=404)
-            await resp(scope, receive, send)
-            return
         await inner(scope, receive, send)
 
     return app

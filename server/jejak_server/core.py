@@ -26,6 +26,7 @@ import jejak_common as jejak
 VALID_TYPES = ["decision", "learning", "finding", "issue", "solution", "architecture",
                "convention", "context", "artifact"]
 WRITE_COMMANDS = {"save", "delete", "restore", "visibility"}
+MAX_CONTENT = 50_000
 
 
 class JejakError(Exception):
@@ -60,7 +61,7 @@ class Ctx:
         if not self.space:
             raise Forbidden("No space to write to. Pick one with: jejak space use <space>")
         if self.space not in self.write_spaces:
-            raise Forbidden("You can read this space but not write to it (your role is viewer).")
+            raise Forbidden("You can read this space but not write to it (your role is viewer, or this sign-in is read-only).")
         return self.space
 
     def need_project(self):
@@ -187,10 +188,13 @@ def save_memory(session, ctx, memory_type, content, source_file=None, supersedes
     """Save one entry. Returns (memory_id, existed, score, topics, superseded_id)."""
     space = space or ctx.write_space()
     if space not in ctx.write_spaces:
-        raise Forbidden("You can read this space but not write to it (your role is viewer).")
+        raise Forbidden("You can read this space but not write to it (your role is viewer, or this sign-in is read-only).")
     key = key or ctx.need_project()
     name = name or ctx.project_name or key
     path = path if path is not None else ctx.directory
+    if len(content or "") > MAX_CONTENT:
+        raise JejakError(f"Too long ({len(content)} characters; the limit is {MAX_CONTENT}). Save the key "
+                         "points, or split it into several entries.")
     content = jejak.redact(content)
     if visibility == "public" and memory_type == "prompt":
         visibility = "confidential"

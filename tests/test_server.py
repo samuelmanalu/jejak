@@ -188,3 +188,77 @@ def test_client_labels_cannot_inject_html(world):
     assert "<" not in raw and ">" not in raw
     page = c.get("/")
     assert "connect-src 'self'" in page.headers["content-security-policy"]
+
+
+@integration
+def test_owner_can_only_invite_and_the_invited_user_decides(world):
+    c, n, t, _ = world
+    h = {"Authorization": f"Bearer {t['alice']}"}
+    r = c.put(f"/v1/spaces/{n['team']}/members/{n['carol']}", headers=h, json={"role": "editor"})
+    assert r.json()["status"] == "invited"
+    hc = {"Authorization": f"Bearer {t['carol']}"}
+    me = c.get("/v1/me", headers=hc).json()
+    assert n["team"] not in [x["slug"] for x in me["spaces"]]
+    assert [i["slug"] for i in me["invitations"]] == [n["team"]]
+    assert "No results" in run(c, t["carol"], "search", {"query": f"Billing uses Postgres {n['team']}"}).json()["output"]
+    assert c.post(f"/v1/spaces/{n['team']}/decline", headers=hc).status_code == 200
+    assert c.get("/v1/me", headers=hc).json()["invitations"] == []
+
+
+@integration
+def test_the_last_owner_cannot_be_demoted(world):
+    c, n, t, _ = world
+    h = {"Authorization": f"Bearer {t['alice']}"}
+    r = c.put(f"/v1/spaces/{n['team']}/members/{n['alice']}", headers=h, json={"role": "viewer"})
+    assert r.status_code == 400 and "owner" in r.json()["error"]
+
+
+@integration
+def test_oversized_requests_and_content_are_refused(world):
+    c, n, t, _ = world
+    h = {"Authorization": f"Bearer {t['alice']}"}
+    assert c.post("/v1/run/save", headers=h, content=b"x" * (2 * 1024 * 1024)).status_code == 413
+    r = run(c, t["alice"], "save", {"type": "context", "content": "y" * 60_000}, n["team"])
+    assert r.json()["exit_code"] == 1 and "Too long" in r.json()["output"]
+
+
+@integration
+def test_bogus_usernames_cost_nothing_and_leave_no_state(world):
+    c, *_ = world
+    from jejak_server import auth
+    before = len(auth._FAILS)
+    for i in range(5):
+        r = c.post("/v1/auth/login", json={"username": "u" * 100_000 + str(i), "password": "x"})
+        assert r.status_code == 401
+    assert len(auth._FAILS) <= before + 1   # only the network counter
+
+
+@integration
+def test_password_change_signs_out_everything_else(world):
+    c, n, t, _ = world
+    from jejak_server import auth
+    from jejak_server.config import driver
+    with driver().session() as s:
+        uid = auth.user_id(s, n["bob"])
+        keep = auth.create_token(s, uid, "keep")
+        other = auth.create_token(s, uid, "other")
+    hk = {"Authorization": f"Bearer {keep}"}
+    r = c.post("/v1/auth/password", headers=hk, json={"old_password": "", "new_password": "a brand new password"})
+    assert r.status_code == 200, r.text
+    assert c.get("/v1/me", headers=hk).status_code == 200
+    assert c.get("/v1/me", headers={"Authorization": f"Bearer {other}"}).status_code == 401
+
+
+@integration
+def test_browser_tokens_are_read_only(world):
+    c, n, t, _ = world
+    from jejak_server import auth
+    from jejak_server.config import driver
+    with driver().session() as s:
+        auth.set_password(s, n["carol"], "carols long password")
+    tok = c.post("/v1/auth/login", json={"username": n["carol"], "password": "carols long password",
+                                         "scopes": ["jejak:read"]}).json()["token"]
+    h = {"Authorization": f"Bearer {tok}"}
+    assert c.get("/v1/me", headers=h).json()["scopes"] == ["jejak:read"]
+    assert c.get("/v1/tokens", headers=h).status_code == 403
+    assert run(c, tok, "save", {"type": "context", "content": "x"}).status_code == 403

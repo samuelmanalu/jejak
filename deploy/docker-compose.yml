@@ -34,6 +34,8 @@ services:
       JEJAK_NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       JEJAK_TRUSTED_PROXIES: "*"     # only Caddy can reach this container
       JEJAK_ACCEPT_PROMPTS: "0"      # a shared server never stores raw prompts
+      JEJAK_PUBLIC_URL: https://${JEJAK_DOMAIN}   # OAuth issuer and token audience
+      JEJAK_OAUTH_REDIRECT_ALLOWLIST: ${JEJAK_OAUTH_REDIRECT_ALLOWLIST:-https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback}
     depends_on:
       neo4j:
         condition: service_healthy

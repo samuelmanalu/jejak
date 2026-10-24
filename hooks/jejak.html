@@ -1591,7 +1591,7 @@
     e.preventDefault();
     const body = { username: document.getElementById('login-user').value.trim(),
                    password: document.getElementById('login-pass').value,
-                   token_name: 'browser', days: 30 };
+                   token_name: 'browser', days: 30, scopes: ['jejak:read'] };
     fetch('/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(r => r.json().then(j => ({ ok: r.ok, j })))
       .then(({ ok, j }) => {

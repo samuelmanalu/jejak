@@ -124,6 +124,43 @@ def run_command(p, command, args, client_ctx):
     return {"output": ctx.text(), "exit_code": 0}
 
 
+# --- request size --------------------------------------------------------------------
+
+MAX_BODY = 1024 * 1024
+
+
+class BodyLimit:
+    """Refuse request bodies over max_bytes, whether or not Content-Length is
+    sent, before any handler (or the MCP app) reads them."""
+
+    def __init__(self, app, max_bytes):
+        self.app, self.max = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        length = dict(scope.get("headers") or []).get(b"content-length")
+        if length and length.isdigit() and int(length) > self.max:
+            return await JSONResponse({"error": "Request too large."}, status_code=413)(scope, receive, send)
+        seen = 0
+
+        async def limited():
+            nonlocal seen
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > self.max:
+                    raise ApiError(413, "Request too large.")
+            return msg
+
+        try:
+            await self.app(scope, limited, send)
+        except ApiError as e:
+            if e.status != 413:
+                raise
+            await JSONResponse({"error": e.error}, status_code=413)(scope, receive, send)
+
+
 # --- graph cache: rebuilt only when the knowledge changes --------------------------------
 
 _graph_cache, _graph_lock = {}, threading.Lock()
@@ -172,6 +209,8 @@ def create_app():
     async def _value_error(_req, e: ValueError):
         return JSONResponse({"error": str(e)}, status_code=400)
 
+    app.add_middleware(BodyLimit, max_bytes=MAX_BODY)
+
     @app.middleware("http")
     async def _security_headers(request, call_next):
         resp = await call_next(request)
@@ -199,9 +238,12 @@ def create_app():
     def login(request: Request, body: dict = Body(...)):
         with _session() as s:
             try:
+                scopes = body.get("scopes")
+                if scopes is not None and (not isinstance(scopes, list) or not set(scopes) <= set(auth.SCOPES)):
+                    raise ApiError(400, f"scopes must be a list of: {', '.join(auth.SCOPES)}")
                 token = auth.login(s, body.get("username"), body.get("password"),
-                                   body.get("token_name") or "login", request.client.host,
-                                   body.get("days"))
+                                   str(body.get("token_name") or "login")[:60], request.client.host,
+                                   body.get("days"), scopes)
             except auth.AuthError as e:
                 raise ApiError(401, str(e))
         return {"token": token}
@@ -225,6 +267,7 @@ def create_app():
     @app.post("/v1/auth/password")
     def change_password(request: Request, body: dict = Body(...)):
         p = principal(request)
+        _need_admin_scope(p)
         with _session() as s:
             has = s.run("MATCH (u:User {user_id: $u}) RETURN u.password_hash AS h", u=p.user_id).single()["h"]
             if has:
@@ -233,19 +276,24 @@ def create_app():
                 except auth.AuthError:
                     raise ApiError(403, "Current password is wrong.")
             auth.set_password(s, p.username, body.get("new_password") or "")
-        return {"ok": True}
+            # A password change means "maybe someone else knows it": sign out everything else.
+            auth.revoke_all_other(s, p.user_id, keep_token_id=p.token_id)
+        return {"ok": True, "note": "Every other token and connected app was signed out."}
 
     @app.get("/v1/me")
     def me(request: Request):
         p = principal(request)
         with _session() as s:
             spaces = [{**auth.space_info(s, sid), "role": role} for sid, role in p.roles.items()]
+            invitations = auth.invitations(s, p.user_id)
         return {"username": p.username, "server_admin": p.is_server_admin,
                 "default_space": p.slugs.get(p.default_space),
                 "spaces": sorted(({"slug": x["slug"], "name": x["name"], "role": x["role"],
                                    "public_graph": bool(x.get("public_graph")),
                                    "personal": bool(x.get("personal"))} for x in spaces),
                                  key=lambda x: x["slug"]),
+                "invitations": invitations,
+                "scopes": list(p.scopes),
                 "accepts_prompts": settings()["accept_prompts"] and is_loopback(request)}
 
     # --- tokens -----------------------------------------------------------------------------
@@ -253,18 +301,21 @@ def create_app():
     @app.get("/v1/tokens")
     def tokens(request: Request):
         p = principal(request)
+        _need_admin_scope(p)
         with _session() as s:
             return {"tokens": auth.list_tokens(s, p.user_id)}
 
     @app.post("/v1/tokens")
     def new_token(request: Request, body: dict = Body(default={})):
         p = principal(request)
+        _need_admin_scope(p)
         with _session() as s:
             return {"token": auth.create_token(s, p.user_id, body.get("name") or "token", body.get("days"))}
 
     @app.delete("/v1/tokens/{token_id}")
     def revoke(token_id: str, request: Request):
         p = principal(request)
+        _need_admin_scope(p)
         if len(token_id) < 8:
             raise ApiError(400, "Give at least 8 characters of the token id.", "jejak token list")
         with _session() as s:
@@ -321,7 +372,13 @@ def create_app():
 
     # --- spaces and members -----------------------------------------------------------------
 
+    def _need_admin_scope(p):
+        if not p.can_admin:
+            raise ApiError(403, "This sign-in was not allowed to manage members, users or tokens.",
+                           "Use the jejak CLI (jejak login), or reconnect the app and tick the manage option.")
+
     def _owned(p, slug):
+        _need_admin_scope(p)
         try:
             sid = p.space_by_slug(slug)
         except auth.AccessError as e:
@@ -337,6 +394,7 @@ def create_app():
     @app.post("/v1/spaces")
     def create_space(request: Request, body: dict = Body(...)):
         p = principal(request)
+        _need_admin_scope(p)
         with _session() as s:
             auth.create_space(s, body.get("slug"), body.get("name"), p.user_id)
         return {"slug": body.get("slug"), "role": "owner"}
@@ -366,10 +424,27 @@ def create_app():
         sid = _owned(p, slug)
         with _session() as s:
             try:
-                auth.set_member(s, sid, auth.user_id(s, username), body.get("role"))
+                status = auth.set_member(s, sid, auth.user_id(s, username), body.get("role"),
+                                         invited_by=p.username)
             except ValueError as e:
                 raise ApiError(400, str(e), "jejak user list  (server admins) or check the spelling")
-        return {"space": slug, "username": username, "role": body.get("role")}
+        out = {"space": slug, "username": username, "role": body.get("role"), "status": status}
+        if status == "invited":
+            out["next"] = f"{username} sees the space after running: jejak space accept {slug}"
+        return out
+
+    @app.post("/v1/spaces/{slug}/{answer}")
+    def answer(slug: str, answer: str, request: Request):
+        p = principal(request)
+        _need_admin_scope(p)
+        if answer not in ("accept", "decline"):
+            raise ApiError(404, "Use accept or decline.")
+        with _session() as s:
+            try:
+                auth.answer_invitation(s, p.user_id, slug, answer == "accept")
+            except ValueError as e:
+                raise ApiError(404, str(e), "jejak whoami  (lists pending invitations)")
+        return {"space": slug, "answer": answer}
 
     @app.delete("/v1/spaces/{slug}/members/{username}")
     def delete_member(slug: str, username: str, request: Request):
@@ -383,6 +458,7 @@ def create_app():
 
     def _admin(request):
         p = principal(request)
+        _need_admin_scope(p)
         if not p.is_server_admin:
             raise ApiError(403, "Only a server admin can manage users.")
         return p
@@ -450,5 +526,7 @@ def create_app():
     def page(slug: str = None):
         return FileResponse(HTML, media_type="text/html")
 
-    app.mount("/", mcp_asgi())  # /mcp; mounted last so the routes above win
+    from . import consent
+    consent.register(app)
+    app.mount("/", mcp_asgi())  # /mcp and OAuth; mounted last so the routes above win
     return app

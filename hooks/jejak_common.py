@@ -41,18 +41,20 @@ _REDACTIONS = [
     # KEY: value / DB_PASSWORD = value / token=value  (quoted or bare).
     # Allows UPPER_SNAKE prefixes like ORACLE_REST_PASSWORD; requires a word
     # boundary AFTER the keyword so "passenger:" won't match.
-    (re.compile(r'(?i)([A-Za-z]*[_-]?(?:password|passwd|pass|secret|token|'
+    # Bounded prefix ({0,40}, not *): an unbounded one backtracked quadratically,
+    # so one 40k-character save froze a server for over a minute.
+    (re.compile(r'(?i)([A-Za-z]{0,40}[_-]?(?:password|passwd|pass|secret|token|'
                 r'api[_-]?key|access[_-]?key|client[_-]?secret|credential)s?)\b'
                 r'\s*[:=]\s*["\']?([^\s"\']{3,})'),
      lambda m: f"{m.group(1)}: [REDACTED]"),
     # provider-style keys
     (re.compile(r'\bsk-[A-Za-z0-9]{16,}\b'), lambda m: "[REDACTED_KEY]"),
     (re.compile(r'\bghp_[A-Za-z0-9]{20,}\b'), lambda m: "[REDACTED_KEY]"),
-    (re.compile(r'\bjj[ki]_[A-Za-z0-9_-]{20,}'), lambda m: "[REDACTED_JEJAK_TOKEN]"),
+    (re.compile(r'\bjj[kiar]_[A-Za-z0-9_-]{20,}'), lambda m: "[REDACTED_JEJAK_TOKEN]"),
     (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), lambda m: "[REDACTED_KEY]"),
     (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'), lambda m: "[REDACTED_KEY]"),
     # connection strings user:pass@host
-    (re.compile(r'(//[^:/\s]+:)([^@/\s]{3,})(@)'), lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}"),
+    (re.compile(r'(//[^:/\s]{1,256}:)([^@/\s]{3,256})(@)'), lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}"),
 ]
 
 def redact(text):

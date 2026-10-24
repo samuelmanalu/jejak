@@ -176,7 +176,8 @@ The client is standard-library Python, with no Neo4j or database driver.
 ```bash
 jejak space create billing-team                            # you are its owner
 jejak user create rani --space billing-team --role editor  # server admins; prints an invite code
-jejak space add-member billing-team dimas viewer           # owners
+jejak space add-member billing-team dimas viewer           # owners: sends an invitation
+jejak space accept billing-team                            # dimas: joins (or: decline)
 jejak space members billing-team
 jejak space use billing-team ~/work/billing    # saves under this folder go to billing-team
 jejak user disable rani                                    # server admins
@@ -188,13 +189,17 @@ jejak user disable rani                                    # server admins
 | `editor` | read, plus save, update, delete, restore, set visibility |
 | `owner` | edit, plus manage members and the space's public graph |
 
+Joining a space is always the member's choice: an owner can only invite, and the space
+stays invisible to the invited user until they accept. (Otherwise an owner could push
+entries into someone else's agent context.) Server admins add members directly.
+
 Reads cover every space you belong to; saves go to your default (personal) space unless
 `jejak space use` or `--space` says otherwise. Knowledge is never linked across spaces.
 
 **Signing in.** New users get a single-use invite code instead of a password or a
-long-lived token. If the code ends up in a chat transcript, it is useless once it has
-been used or has expired. Users who want the web page set a password with
-`jejak password`. Agents and MCP clients use tokens:
+long-lived token; MCP apps sign in through the browser (see below). If the code ends up in a chat transcript, it is useless once it has
+been used or has expired. The first sign-in through an MCP app's browser page uses
+the invite code and sets a password (or `jejak login --invite`, then `jejak password`). Scripts and CI use tokens:
 
 ```bash
 jejak token create gemini --file ~/.jejak/gemini.token    # written to a file, never printed
@@ -252,25 +257,52 @@ If the server can't be reached, saves are queued in `~/.jejak/outbox/` (chmod 60
 sent automatically by the next `jejak` command. Context lookups give up after 2 seconds,
 so a session never waits on the server.
 
-### Other AI tools (MCP): Gemini CLI, Antigravity, Cursor, …
+### Other AI tools (MCP): Gemini CLI, Antigravity, Cursor, Claude, …
 
-The server is an MCP server, over streamable HTTP at `/mcp`. Create a token, then:
+The server is an MCP server, over streamable HTTP at `/mcp`. **Give your agent only the
+URL.** On first use it opens your browser on the Jejak server. You sign in there (the
+first time with your invite code, choosing a password), see which app is asking and
+where access will go, and click Allow. The agent gets short-lived tokens and renews them
+by itself; you never copy a token.
 
 ```json
-{
-  "mcpServers": {
-    "jejak": {
-      "url": "https://jejak.example.com/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
-    }
-  }
-}
+{ "mcpServers": { "jejak": { "url": "https://jejak.example.com/mcp" } } }
 ```
 
-Tools: `jejak_whoami`, `jejak_save`, `jejak_check_duplicates`, `jejak_ask`,
-`jejak_search`, `jejak_get`, `jejak_links`, `jejak_map`, `jejak_rank`, `jejak_topics`,
-`jejak_session`, `jejak_stats`, `jejak_update`, `jejak_set_visibility`, `jejak_delete`,
-`jejak_restore`. They run with the token owner's spaces and role.
+```bash
+claude mcp add --transport http jejak https://jejak.example.com/mcp     # Claude Code
+```
+
+You choose what a connected app may do: read (always), save and change knowledge
+(ticked by default), and manage members, users and tokens (unticked by default). Your
+role in each space still applies on top. Connected apps show up in `jejak token list`;
+`jejak token revoke <id>` disconnects one immediately.
+
+How the sign-in is protected (standard OAuth 2.1 for MCP):
+
+- **PKCE (S256) is required**, so a stolen authorization code is useless without the
+  client's secret verifier.
+- **Codes only go to your own machine.** Apps may register `http://127.0.0.1`/`localhost`
+  addresses (any port) or app links (`cursor://…`). Websites are allowed only for
+  allowlisted callbacks (`JEJAK_OAUTH_REDIRECT_ALLOWLIST`; Claude's by default). A
+  phishing site cannot register itself to receive your code.
+- **Codes are single-use and live 60 seconds.** Using one twice revokes everything it
+  produced.
+- **Access tokens live 1 hour; refresh tokens are replaced on every use.** If an old
+  refresh token is presented again, it was stolen, so the whole sign-in is revoked.
+- **Tokens are bound to this server's `/mcp`** and stored only as hashes. Refresh tokens
+  never work as access tokens.
+- **The consent page** is protected against forged submissions (a strict cookie plus a
+  form token) and against being shown inside another site. It runs no script, escapes
+  everything an app says about itself, and states in plain words where access goes.
+- **Rate limits** on `/register`, `/authorize`, `/token` and `/revoke`; password and
+  invite attempts are throttled per user and per address.
+
+Personal access tokens still work, for scripts, CI and clients without OAuth:
+
+```bash
+jejak token create ci --file ~/.jejak/ci.token     # then send Authorization: Bearer <token>
+```
 
 For clients that only speak stdio, `hooks/jejak-mcp.py` is a bridge that uses this
 machine's `jejak login`:
@@ -349,9 +381,15 @@ never through a public repo.
 
 - **Only the server touches Neo4j.** Neo4j listens on 127.0.0.1 (personal install) or
   only inside the compose network (team server).
-- **Authentication.** argon2 password hashes; tokens are 32 random bytes and stored
-  only as sha256; tokens can expire and be revoked. Invite codes are single-use and
-  expire. Failed logins are throttled per user and per address.
+- **Authentication.**
+  - Passwords: argon2 hashes, at least 12 characters, at most 4 hashes computed at a time.
+  - Tokens: 32 random bytes, stored only as sha256; they can expire and be revoked.
+  - Invite codes: single-use, and they expire.
+  - Throttling: every attempt counts per network (an IPv6 /64 counts as one), and
+    failures count per account. Throttle memory is bounded.
+  - Changing your password signs out every other token and connected app.
+- **Abuse limits.** Request bodies are capped at 1 MiB, and saved knowledge at 50,000
+  characters. Redaction patterns are bounded, so no input can make them run for minutes.
 - **Authorization** happens on the server for every request. Every query is limited to
   the caller's spaces; a test fails if a memory query isn't.
 - **Transport.** The client refuses to send a token over plain `http://` to another

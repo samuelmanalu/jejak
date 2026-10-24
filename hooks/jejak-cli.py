@@ -14,6 +14,7 @@ Connection and access:
   jejak login <url> [--invite | --token-stdin]    jejak logout    jejak whoami    jejak status
   jejak space list | create <slug> | use <slug> [DIR] | members <slug>
               | add-member <slug> <user> <viewer|editor|owner> | remove-member <slug> <user>
+              | accept <slug> | decline <slug>   (invitations from space owners)
               | public <slug> on|off
   jejak token list | create <name> [--days N] [--file F] | revoke <id>
   jejak user list | create <name> [--space S --role R] [--admin] | invite <name> | disable|enable <name>
@@ -104,7 +105,8 @@ def cmd_login(args):
                                {"username": username, "password": password,
                                 "token_name": jejak.machine_name()},
                                auth=False, server=server)["token"]
-    cfg.update({"server": server, "token": token})
+    cfg.update({"server": server, "token": token, "insecure_for": server if args.insecure else None})
+    cfg.pop("insecure", None)
     me = client.request("GET", "/v1/me", cfg=cfg)
     cfg["accepts_prompts"] = bool(me.get("accepts_prompts"))
     client.save_config(cfg)
@@ -136,6 +138,9 @@ def cmd_whoami(args):
     for s in me["spaces"]:
         flags = ", public graph" if s["public_graph"] else ""
         print(f"  {s['slug']:24s} {s['role']}{flags}")
+    for inv in me.get("invitations") or []:
+        print(f"  invited to {inv['slug']} as {inv['role']} by {inv['invited_by']}: "
+              f"jejak space accept {inv['slug']}  (or decline)")
 
 
 def cmd_status(args):
@@ -181,7 +186,7 @@ def cmd_password(args):
     if not sys.stdin.isatty():
         fail("Changing a password needs a terminal.", "Let the user run: ! jejak password")
     old = getpass.getpass("Current password (empty if you never set one): ")
-    new = getpass.getpass("New password (10+ characters): ")
+    new = getpass.getpass("New password (12+ characters): ")
     if new != getpass.getpass("Again: "):
         fail("The new passwords differ.")
     client.request("POST", "/v1/auth/password", {"old_password": old, "new_password": new})
@@ -213,6 +218,8 @@ def cmd_space(args):
              args.as_json)
     elif op == "remove-member":
         emit(client.request("DELETE", f"/v1/spaces/{args.slug}/members/{args.username}"), args.as_json)
+    elif op in ("accept", "decline"):
+        emit(client.request("POST", f"/v1/spaces/{args.slug}/{op}"), args.as_json)
     elif op == "public":
         r = client.request("PATCH", f"/v1/spaces/{args.slug}", {"public_graph": args.state == "on"})
         url = client.load_config().get("server", "") + f"/s/{args.slug}"
@@ -345,6 +352,8 @@ def parser():
     rm = ssub.add_parser("remove-member")
     rm.add_argument("slug")
     rm.add_argument("username")
+    for name in ("accept", "decline"):
+        ssub.add_parser(name, help=f"{name} an invitation to a space").add_argument("slug")
     pb = ssub.add_parser("public")
     pb.add_argument("slug")
     pb.add_argument("state", choices=["on", "off"])
