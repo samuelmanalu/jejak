@@ -1,2 +1,5 @@
+# Only the host-side tools need these (tools/jejak-sync.py, hooks/recap-cli.py).
+# The client (hooks, CLI) is standard-library Python; the server has its own
+# environment in server/pyproject.toml.
 neo4j>=5.0
 mysql-connector-python>=8.0

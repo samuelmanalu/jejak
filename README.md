@@ -1,21 +1,25 @@
 # Jejak
 
 **Persistent, self-ranking memory for AI coding agents: [Claude Code](https://claude.com/claude-code),
-and any MCP client such as Gemini CLI, Antigravity or Cursor.**
+and any MCP client such as Gemini CLI, Antigravity or Cursor. Run it for yourself, or as
+one server for your whole team.**
 
 *Jejak* is Indonesian for *trail* — the trail of everything you and your AI assistant
 worked out together, so the next session doesn't start from zero.
 
 AI coding agents forget everything when a session ends. Jejak stores the decisions and
-root causes worth keeping as a graph in Neo4j and brings the most relevant ones back
+root causes worth keeping as a knowledge graph and brings the most relevant ones back
 the next time you work in that project, whichever agent you use.
 
-- **Claude Code** gets the full, automatic version: Jejak hooks into the session
-  lifecycle, extracts what was learned, and loads it back into context on its own.
-- **Any MCP client** (Gemini CLI, Antigravity, Cursor, …) gets the same graph through
-  the [MCP server](#other-ai-tools-mcp-gemini-cli-antigravity-cursor-), with full
-  create/read/update/delete. There the agent saves and looks up knowledge when it
-  decides to, guided by the server's rules.
+Jejak works like a database server. Installing it gives you a **Jejak server** (Neo4j
+included). Everything else is a **client** that signs in with a token: the Claude Code
+hooks, the `jejak` CLI, and any MCP client. Run the server on your laptop for yourself,
+or on a VPS for a team, with users, shared spaces and roles.
+
+- **Claude Code** gets the full, automatic version: hooks extract what was learned in
+  each session and load the right knowledge back into context on their own.
+- **Any MCP client** connects to `https://<server>/mcp` with a token, with nothing to
+  install, and gets full create/read/update/delete.
 
 No manual note-taking. No `NOTES.md` that goes stale. The graph decides what matters
 by scoring what you actually keep coming back to.
@@ -29,41 +33,49 @@ by scoring what you actually keep coming back to.
 | **Remembers automatically** | A `Stop` hook reads each exchange, extracts what's worth keeping, and saves it — typed as `decision`, `learning`, `solution`, `convention`, `issue`, `architecture`, `context`, or `finding`. |
 | **Ranks by real usage** | Every memory carries a `relevance_score` computed from hits, session spread, project spread, and graph connections — weighted by type, decayed over time. Nothing is manually promoted. |
 | **Loads in layers** | Top-5 global knowledge loads in *every* session; top-10 project knowledge loads when you're in that directory; everything else is one `/jejak search` away. |
-| **Links across projects** | Memories connect through shared topics, so a lesson learned in one repo surfaces in another when it's relevant. |
+| **Shares with a team** | One server, many users. Knowledge lives in spaces (your personal one, plus team spaces) and every member has a role: owner, editor or viewer. |
+| **Links across projects** | Memories connect through shared topics inside a space, so a lesson learned in one repo surfaces in another when it's relevant. |
 | **Deduplicates semantically** | Before saving, a conflict-pruning pass compares against existing knowledge: duplicates are dropped, contradictions mark the old entry `superseded` (reversibly). |
-| **Indexes your documents** | Markdown, PDFs, spreadsheets, notebooks and published artifacts are captured automatically and made searchable. |
-| **Redacts secrets** | Tokens, API keys, passwords and connection strings are scrubbed *before* anything is written to disk. |
-| **Works beyond Claude** | An MCP server exposes the same graph to Gemini CLI, Antigravity, Cursor and other MCP clients, so knowledge saved in one agent is there in the next. |
+| **Redacts secrets** | Tokens, API keys, passwords and connection strings are scrubbed *before* anything is stored, on the client and again on the server. |
+| **Built for agents** | Most callers are AI agents, so every error ends with a `hint:` naming the command that fixes it, and `jejak status` answers "is Jejak ready here?" in one call. |
 
 ---
 
 ## How it works
 
 ```
-            ┌──────────────── Claude Code session ────────────────┐
-            │                                                     │
- SessionStart ──> jejak.py         loads L1 + L2 memories into context
- UserPromptSubmit ─> jejak.py      injects related past knowledge
-                   prompt-logger.py  logs the prompt (MySQL)
- PostToolUse ────> jejak-artifact.py  indexes documents & artifacts
- Stop ───────────> jejak-extract.py   extracts + saves what was learned
- SessionEnd ─────> jejak.py         writes the session summary
-            │                                                     │
-            └─────────────────────┬───────────────────────────────┘
-                                  ▼
-                     Neo4j  (the knowledge graph)
-                     MySQL  (flat prompt log)
+ Claude Code hooks ─┐                    ┌────────────── Jejak server ──────────────┐
+ jejak CLI ─────────┼── HTTPS + token ──►│ /v1   HTTP API   ┐                       │
+ Gemini, Cursor, …  ┘   (MCP over HTTP)  │ /mcp  MCP        ├─ auth → role → query ─┼─► Neo4j
+                                         │ /     graph page ┘                       │   (private)
+                                         └──────────────────────────────────────────┘
 ```
+
+| Hook | What it does |
+|---|---|
+| `SessionStart` → `jejak.py` | loads L1 + L2 memories into context |
+| `UserPromptSubmit` → `jejak.py` | adds related past knowledge for the prompt's topics |
+| `PostToolUse` → `jejak-artifact.py` | indexes documents and artifacts |
+| `Stop` → `jejak-extract.py` | extracts and saves what was learned |
+| `SessionEnd` → `jejak.py` | writes a short session summary |
+
+The server is the only thing that talks to Neo4j. Neo4j Community has no roles, so
+users, spaces and roles are enforced by the server, and Neo4j is never exposed.
 
 ### The graph
 
 ```
 (Memory)--[:ABOUT]------->(Topic)
-(Memory)--[:IN_PROJECT]-->(Project)
-(Memory)--[:IN_SESSION]-->(Session)
-(Memory)--[:RELATES_TO {strength}]-->(Memory)
+(Memory)--[:IN_PROJECT]-->(Project)          every Memory, Project and Session
+(Memory)--[:IN_SESSION]-->(Session)          belongs to one space (space_id)
+(Memory)--[:RELATES_TO {strength}]-->(Memory)   only ever inside one space
 (Session)--[:IN_PROJECT]->(Project)
+(User)--[:MEMBER_OF {role}]->(Space)         role: owner | editor | viewer
+(Token)--[:OF]->(User)                        only the token's sha256 is stored
 ```
+
+A project is identified by its git remote (`github.com/org/repo`), or by the directory
+name when there is none, so teammates with different paths share one project.
 
 ### The scoring formula
 
@@ -86,78 +98,41 @@ never touched. That's the whole design: **the math decides, not you.**
 | **L3** | Everything else | On demand — `/jejak search`, `/jejak ask` |
 | **L4** | Not in the graph | Falls back to reading the codebase |
 
+
 ---
 
-## Set up a new machine
+## Install (personal: server + client on this machine)
 
-One command, for a machine that should pick up knowledge you already have elsewhere:
-
-```bash
-git clone https://github.com/samuelmanalu/jejak.git ~/dev/jejak
-cd ~/dev/jejak
-./setup-machine.sh
-```
-
-It checks prerequisites, stores a GitHub credential, collects this machine's own database
-passwords, verifies Neo4j and MySQL are reachable *before* doing any work, installs
-everything, connects to your private knowledge repo, pulls, verifies checksums and starts
-the sync daemon. Idempotent — re-run it if a step fails.
-
-Non-interactive, for a scripted build:
-
-```bash
-JEJAK_KNOWLEDGE_REPO=https://github.com/you/jejak-knowledge.git \
-JEJAK_COMMIT_EMAIL=you@example.com \
-JEJAK_INTERVAL=900 ./setup-machine.sh
-```
-
-Knowledge syncs; prompt history does not — that machine's `/recap` starts empty. Move a
-`backup` tarball if you want the whole history.
-
-## Install
-
-**Requirements:** Python 3.9+, [Neo4j](https://neo4j.com/download/) 5.x or 2025+ (calendar
-versions; Homebrew ships 2026.x), MySQL 8.x (`brew install mysql@8.4` — plain `mysql` is newer),
-Claude Code.
+**Requirements:** Python 3.9+, [uv](https://docs.astral.sh/uv/), and either Docker or
+Homebrew (for Neo4j), plus Claude Code.
 
 ```bash
 git clone https://github.com/samuelmanalu/jejak.git
 cd jejak
 ./install.sh
-# edit ~/.claude/hooks/db-config.json with your credentials
-./install.sh          # re-run: applies schema and finishes
 ```
 
-That's the whole install. `install.sh` does all of it:
+`install.sh`:
 
-1. installs the Python dependencies
-2. copies the hooks and skills into `~/.claude`
-3. seeds `db-config.json` (and never overwrites one you already have)
-4. applies the Neo4j and MySQL schema
-5. **registers the hooks in `~/.claude/settings.json`**
-6. **inserts the Jejak rules into `~/.claude/CLAUDE.md`**
-7. verifies the CLI can reach the database
+1. installs `jejak-server` into `~/.jejak/app`;
+2. finds or starts Neo4j on `127.0.0.1`: an existing Jejak install's Neo4j, else a Docker
+   container, else Homebrew, with a random password kept in `~/.jejak/server.json` (chmod 600);
+3. creates you as the server admin, with a personal space, and starts the server on
+   `http://127.0.0.1:7700` (launchd on macOS, a systemd user service on Linux);
+4. copies the hooks, CLI and skill into `~/.claude`, registers the hooks in
+   `settings.json`, inserts the Jejak rules into `CLAUDE.md`, and adds a `jejak` command
+   to `~/.local/bin`;
+5. signs this machine in. No password or token is printed.
 
-Steps 5 and 6 merge into whatever you already have — your own hooks, your own rules,
-and any other top-level settings are preserved. The `CLAUDE.md` rules live between
-`<!-- JEJAK:BEGIN -->` / `<!-- JEJAK:END -->` markers, so upgrading refreshes that block
-in place and leaves the rest of the file untouched.
+Then restart Claude Code and run `jejak status`.
 
-Re-running is safe: hooks are matched on (event, matcher, command) so nothing is ever
-registered twice, and every file the installer rewrites is backed up as
-`<file>.pre-jejak.<timestamp>` first.
+**Upgrading from a pre-server Jejak** (one local Neo4j, no server): `./install.sh` reuses
+your Neo4j. `./install.sh --migrate` also backs up your graph and moves every memory into
+your personal space. Nothing is deleted. Copies of the same repo in two folders become one
+project.
 
-Installing somewhere else:
-
-```bash
-CLAUDE_HOME=/path/to/.claude ./install.sh
-```
-
-Restart Claude Code, then:
-
-```bash
-/jejak stats
-```
+Re-running is safe. Hooks are matched on (event, matcher, command) and never registered
+twice, and every file the installer rewrites is backed up first.
 
 ### What the CLAUDE.md rules do
 
@@ -170,25 +145,86 @@ Claude that the graph is the single interface for knowledge:
 - **Look up** — query the graph with `jejak ask` / `search` / `map` *before* reading the
   codebase, and stop as soon as it answers
 
+
+## Run a team server
+
+On any VPS with Docker and a DNS name pointing at it:
+
+```bash
+git clone https://github.com/samuelmanalu/jejak.git && cd jejak/deploy
+cp .env.example .env              # set JEJAK_DOMAIN and NEO4J_PASSWORD
+docker compose up -d              # Neo4j (private) + jejak-server + Caddy (HTTPS)
+docker compose run --rm jejak admin init --admin <you>
+```
+
+The last command prints a **single-use invite code** (valid 24 hours) for you. Run
+`./backup.sh` nightly from cron. It dumps Neo4j to `deploy/backups/`; Neo4j pauses for
+seconds, and clients queue their saves meanwhile.
+
+### Connect a machine (client only)
+
+```bash
+./install.sh --client https://jejak.example.com
+jejak login https://jejak.example.com --invite     # paste the invite code
+jejak status
+```
+
+The client is standard-library Python, with no Neo4j or database driver.
+
+### Users, spaces and roles
+
+```bash
+jejak space create billing-team                            # you are its owner
+jejak user create rani --space billing-team --role editor  # server admins; prints an invite code
+jejak space add-member billing-team dimas viewer           # owners
+jejak space members billing-team
+jejak space use billing-team ~/work/billing    # saves under this folder go to billing-team
+jejak user disable rani                                    # server admins
+```
+
+| Role | Can |
+|---|---|
+| `viewer` | read: search, ask, map, rank, links, graph |
+| `editor` | read, plus save, update, delete, restore, set visibility |
+| `owner` | edit, plus manage members and the space's public graph |
+
+Reads cover every space you belong to; saves go to your default (personal) space unless
+`jejak space use` or `--space` says otherwise. Knowledge is never linked across spaces.
+
+**Signing in.** New users get a single-use invite code instead of a password or a
+long-lived token. If the code ends up in a chat transcript, it is useless once it has
+been used or has expired. Users who want the web page set a password with
+`jejak password`. Agents and MCP clients use tokens:
+
+```bash
+jejak token create gemini --file ~/.jejak/gemini.token    # written to a file, never printed
+jejak token list
+jejak token revoke <id>
+```
+
 ## Usage
 
 ```
-/jejak save <type> <content>     Save a knowledge entry (dedup-checked)
+/jejak save <type> <content>      Save a knowledge entry (dedup-checked)
 /jejak save ... --supersedes <id> Update: replace an existing entry
-/jejak check-duplicates <text>   Check for duplicates/conflicts before saving
-/jejak search <query>            Search across all knowledge
-/jejak ask <question>            Answer a question from the graph
-/jejak map [directory]           Full knowledge map for a project
-/jejak rank [directory] [-a]     Knowledge ranked by relevance score
-/jejak links <memory_id>         Every connection for one memory
-/jejak topics [directory]        Topic frequency clusters
-/jejak session [session_id]      Everything from one session
-/jejak stats                     Global stats
-/jejak export [dir] [-a]         Export as Markdown documentation
-/jejak get <memory_id> [--json]  One memory in full, any status
-/jejak delete <memory_id> -r why Soft-delete (hidden everywhere, kept for audit)
-/jejak restore <memory_id>       Bring a deleted memory back as a new entry
-/jejak visibility public <id>... Mark memories public (default: confidential)
+/jejak save ... --space <slug>    Save to a specific space
+/jejak check-duplicates <text>    Check for duplicates/conflicts before saving
+/jejak search <query>             Search across all your spaces
+/jejak ask <question>             Answer a question from the graph
+/jejak map [directory]            Full knowledge map for a project
+/jejak rank [directory] [-a]      Knowledge ranked by relevance score
+/jejak links <memory_id>          Every connection for one memory
+/jejak topics [directory]         Topic frequency clusters
+/jejak session [session_id]       Everything from one session
+/jejak stats                      Counts across your spaces
+/jejak export [dir] [-a]          Export as Markdown documentation
+/jejak get <memory_id> [--json]   One memory in full, any status
+/jejak delete <memory_id> -r why  Soft-delete (hidden everywhere, kept for audit)
+/jejak restore <memory_id>        Bring a deleted memory back as a new entry
+/jejak visibility public <id>...  Mark memories public (default: confidential)
+
+jejak status | whoami | login | logout | password
+jejak space ... | user ... | token ...
 ```
 
 Link knowledge to code with `-f`:
@@ -198,68 +234,67 @@ jejak save learning "Disbursal uses LAZY fetch to prevent OOM" \
   -f "src/main/java/Disbursal.java"
 ```
 
+### For AI agents
+
+- `jejak status` (add `--json` before the command for JSON: `jejak --json status`)
+  reports the server, the login, the space and role for the current directory, and
+  queued offline saves. It exits non-zero with a `hint:` when something needs fixing.
+- Every error is `error: …` plus `hint: <command that fixes it>` on stderr. HTTP
+  errors are `{"error": …, "hint": …}`.
+- Nothing prompts for input except a password login, which is for the human:
+  `! jejak login <url>`. Agents use `--invite` (code on stdin or in `JEJAK_INVITE`)
+  or `--token-stdin`.
+- Secrets never go in command arguments, and tokens are written only to chmod-600 files.
+
+### Offline
+
+If the server can't be reached, saves are queued in `~/.jejak/outbox/` (chmod 600) and
+sent automatically by the next `jejak` command. Context lookups give up after 2 seconds,
+so a session never waits on the server.
+
 ### Other AI tools (MCP): Gemini CLI, Antigravity, Cursor, …
 
-`hooks/jejak-mcp.py` is an MCP server with full create/read/update/delete:
-`jejak_save`, `jejak_check_duplicates`, `jejak_ask`, `jejak_search`, `jejak_get`,
-`jejak_links`, `jejak_map`, `jejak_rank`, `jejak_topics`, `jejak_session`,
-`jejak_stats`, `jejak_update`, `jejak_delete`, `jejak_restore`.
-
-Every tool calls `jejak-cli.py`, so redaction, dedup, scoring and the
-supersede/soft-delete rules are the same as in Claude Code. Updates never edit in
-place: `jejak_update` saves a new version that supersedes the old one. Deletes are
-soft. Needs [`uv`](https://docs.astral.sh/uv/), which installs the `mcp` package on
-first run.
-
-Register it in the client's MCP config (same shape for Gemini CLI's
-`~/.gemini/settings.json` and Antigravity's raw MCP config):
+The server is an MCP server, over streamable HTTP at `/mcp`. Create a token, then:
 
 ```json
 {
   "mcpServers": {
     "jejak": {
-      "command": "uv",
-      "args": ["run", "--quiet", "--script", "/Users/<you>/.claude/hooks/jejak-mcp.py"],
-      "env": { "JEJAK_CLIENT": "gemini" }
+      "url": "https://jejak.example.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
 
-`JEJAK_CLIENT` names the session saves are filed under (`gemini-2026-10-21`).
-`JEJAK_DEFAULT_DIR` sets the project when a call passes no `directory`.
-`JEJAK_PYTHON` points at an interpreter with the `neo4j` driver if auto-detection
-picks the wrong one. Automatic capture (prompt logging, end-of-turn extraction,
-context injection) stays Claude Code only; other clients save when the model
-decides to, guided by the server's instructions.
+Tools: `jejak_whoami`, `jejak_save`, `jejak_check_duplicates`, `jejak_ask`,
+`jejak_search`, `jejak_get`, `jejak_links`, `jejak_map`, `jejak_rank`, `jejak_topics`,
+`jejak_session`, `jejak_stats`, `jejak_update`, `jejak_set_visibility`, `jejak_delete`,
+`jejak_restore`. They run with the token owner's spaces and role.
 
-Whatever a client reads from Jejak goes to that client's model provider. Check that
-your organisation allows that before connecting it.
+For clients that only speak stdio, `hooks/jejak-mcp.py` is a bridge that uses this
+machine's `jejak login`:
+
+```json
+{ "mcpServers": { "jejak": { "command": "uv",
+  "args": ["run", "--quiet", "--script", "/Users/<you>/.claude/hooks/jejak-mcp.py"],
+  "env": { "JEJAK_CLIENT": "gemini" } } } }
+```
+
+Automatic capture stays Claude Code only. Other clients save when the model decides to,
+guided by the server's instructions. Whatever a client reads from Jejak goes to that
+client's model provider, so check that your organisation allows that.
 
 ### Visualize
 
-```bash
-python3 ~/.claude/hooks/serve-graph.py     # http://127.0.0.1:8787
-```
-
-A force-directed canvas graph — colour by type, filter by project, click to inspect.
-Bound to loopback only. Neo4j Browser at `http://localhost:7474` also works.
+Open the server in a browser (`http://127.0.0.1:7700` for a personal install) and sign
+in. A force-directed map: colour by type, filter by project, pick a space, click to
+inspect. It works on phones (drag, pinch, tap; details in a bottom sheet). Press `L` to
+lay the map out again, `F` to fit it to the screen.
 
 Every active memory is drawn, but each brings only its 10 strongest links
-(`JEJAK_GRAPH_EDGES_PER_NODE` to change it). Topic linking makes the stored graph
-nearly complete, far more than a browser can draw. The trimming is display-only: the
-viewer only reads, and every link stays in Neo4j for ranking, `links` and `ask`. The
-graph is rebuilt only when the knowledge changes, so the page's 10-second refresh
-stays cheap.
-
-The map is static. The layout runs once (seconds, in the background, even if the tab
-is hidden), then stops and is remembered in the browser, so reopening the page shows
-the same map instantly. New knowledge appears next to a linked bubble without
-disturbing the rest. A dragged bubble stays where you drop it. Press `L` to lay the
-map out again, `F` to fit it to the screen.
-
-It works on phones: drag to pan, pinch to zoom, tap a bubble for its details in a
-bottom sheet; filters sit behind a Filters button.
+(`JEJAK_EDGES_PER_NODE` to change it). The trimming is display-only: every link stays
+in Neo4j for ranking, `links` and `ask`.
 
 #### Public view: share the map, keep the details
 
@@ -268,16 +303,13 @@ Every memory is `confidential` unless it is marked `public`:
 ```bash
 jejak save decision "Dark mode is the default" --visibility public   # when saving
 jejak visibility public 3f8b6a70 9c1d2e4f                           # later
-jejak visibility confidential 3f8b6a70                              # take it back
-python3 ~/.claude/hooks/serve-graph.py --public --port 8788         # public view
+jejak space public my-site on        # anyone can open https://<server>/s/my-site
 ```
 
-The public view still draws every memory and link, so the shape of your knowledge
-is visible, but a confidential memory is a faint, anonymous bubble: its content,
-topics, projects and sessions are blanked inside the Neo4j query, so they never
-reach the server process, let alone the browser. Prompts always stay confidential.
-The server binds to loopback; to publish it, put a reverse proxy (with TLS) in
-front of the `--public` instance only, never the private one.
+The public view draws every memory and link of that space, but a confidential memory is
+a faint, anonymous bubble. Its content, topics, projects and sessions are blanked inside
+the Neo4j query, so they never reach the server process, let alone the browser. Prompts
+always stay confidential.
 
 ### Bonus: `/recap`
 
@@ -290,290 +322,75 @@ short end-of-day report:
 /recap --days 7 --detail
 ```
 
+
+`/recap` reads Neo4j and the MySQL prompt log directly, so it runs on the machine that
+hosts the server (a personal install).
+
 ---
 
-## Syncing across machines
+## Moving knowledge
 
-Jejak's knowledge lives in your local Neo4j, so a second machine starts empty. `tools/jejak-sync.py`
-moves knowledge between them — for a one-off migration or an ongoing two-way sync.
-
-```bash
-# on the machine that has the knowledge
-python3 tools/jejak-sync.py export
-#   -> jejak-<host>-<timestamp>.jsonl.gz
-
-# move it however you like: scp, git, USB, Dropbox
-
-# on the other machine
-python3 tools/jejak-sync.py inspect jejak-....jsonl.gz    # look before you leap
-python3 tools/jejak-sync.py import  jejak-....jsonl.gz --dry-run
-python3 tools/jejak-sync.py import  jejak-....jsonl.gz
-```
-
-Run it in both directions and the two machines converge.
-
-### Changing laptops: full backup
-
-`export` carries knowledge only. For a machine move — or a real backup — `backup` takes
-everything: all memories *including* prompts, the MySQL prompt log, and your Jejak config.
+A team server replaces the old git-based sync: every machine signed in to one server
+sees the same knowledge, live. To move knowledge from one Jejak database to another
+(for example from a personal install to a team server), use `tools/jejak-sync.py` on
+the hosts:
 
 ```bash
-python3 tools/jejak-sync.py backup
-#   -> jejak-backup-<host>-<timestamp>.tar.gz
+python3 tools/jejak-sync.py export --project ~/dev/myrepo -o myrepo.jsonl.gz    # source host
+python3 tools/jejak-sync.py import myrepo.jsonl.gz                             # target host
+python3 -m jejak_server admin migrate --owner <user>   # put the imported entries in a space
 ```
 
-```
-manifest.json                      what this is, where it came from
-graph.jsonl.gz                     every memory, prompts included
-prompt_logs.jsonl.gz               the MySQL prompt log
-config/CLAUDE.md.jejak-block.md    your Jejak rules block
-config/settings.hooks.json         your hook registrations
-```
-
-On the new laptop:
-
-```bash
-git clone https://github.com/samuelmanalu/jejak.git && cd jejak && ./install.sh
-# edit ~/.claude/hooks/db-config.json
-./install.sh                                          # schema + wiring
-python3 tools/jejak-sync.py restore jejak-backup-....tar.gz
-```
-
-A whole working setup — 3,788 memories and 1,621 prompt-log rows — packs into under 1 MB.
-
-Restore is a **merge**, not an overwrite, so it is safe to run onto a machine already in
-use: memories dedupe on `memory_id`, prompt-log rows on `(machine_name, session_id,
-created_at)`. `--dry-run` shows the plan first.
-
-**Credentials are never in the backup.** `db-config.json` is excluded by design — move
-your passwords yourself. The manifest records `contains_credentials: false`.
-
-### Syncing through a private git repo
-
-Instead of copying files around, point Jejak at a git repo and let it be the transport.
-
-> **Two repos, always.** This repository is the *engine* and is public. Your knowledge goes
-> in a **separate, private** repo — never here. `jejak-sync` enforces that: it calls the
-> GitHub API before every push and refuses if the target is public.
-
-```bash
-# once, on each machine
-python3 tools/jejak-sync.py remote init git@github.com:you/jejak-knowledge.git
-
-# thereafter
-python3 tools/jejak-sync.py push     # local graph -> repo
-python3 tools/jejak-sync.py pull     # repo -> local graph (a merge)
-python3 tools/jejak-sync.py sync     # pull then push: converge
-```
-
-The clone lives at `~/.claude/jejak-knowledge`, well outside any project.
-
-**Storage is sharded, not one blob.** Memories are written to `knowledge/<first 2 chars of
-memory_id>.jsonl` — 256 files, each sorted, with sorted keys. This matters:
-
-| | |
-|---|---|
-| **Small diffs** | Adding one memory changes exactly two files: its shard and the manifest. Not a 500 KB blob rewritten every sync. |
-| **Few conflicts** | Two machines adding different memories almost always land in different shards, so git merges them without a word. |
-| **Readable history** | `git log -p knowledge/` shows what you learned, as text. |
-| **Deterministic** | Re-running `push` with no new knowledge reports *nothing changed*. |
-
-That last point took a fix worth knowing about: `last_accessed_at` is bumped by the session
-hooks on every surfaced memory, so syncing it churned five shards per session with no
-knowledge change. It is now treated as local telemetry and never leaves the machine.
-`hit_count` *is* synced — it only moves on a real re-save — and merges as `max()`, so
-"this proved useful" survives across machines.
-
-Conflicts, if two machines really do edit the same entry, resolve the same way as any
-import: newest `updated_at` wins, and `superseded` stays monotonic.
-
-#### Syncing on a timer
-
-`SessionEnd` only fires when a session ends cleanly, and it only pushes. For knowledge to
-reach the repo regardless — and for other machines' knowledge to reach this one — install the
-daemon. Each tick pulls first, then pushes anything new (or any commit a failed push left
-behind), so two machines converge within one interval:
-
-```bash
-python3 tools/jejak-sync.py daemon install --interval 900   # every 15 min
-python3 tools/jejak-sync.py daemon status
-python3 tools/jejak-sync.py daemon run                      # one-shot, verbose
-python3 tools/jejak-sync.py daemon uninstall
-```
-
-On macOS this writes a launchd agent (`tech.jejak.sync`), so it survives logout and reboot.
-It also runs once at login rather than 15 minutes later: it waits up to 3 minutes for Neo4j
-to finish booting, and ignores a lock left by a run that shutdown killed.
-Elsewhere it writes the config and prints the crontab line to use. The interval lives in
-`~/.claude/hooks/jejak-daemon.json` and the minimum is 60s.
-
-**Detection is deterministic; the model only writes the message.** Whether knowledge is
-unsynced is a set difference between the graph and the repo — a fact, not a judgement — so
-no model sits in that path. An idle tick costs ~2s (mostly the `git pull`), makes no commit,
-writes no log line and calls no model.
-
-When there *is* new knowledge, Haiku (via the same `claude -p` path the extractor uses)
-turns the commit subject into something you can read months later:
-
-```
-Jejak daemon: launchd scheduling and deterministic sync detection
-Jejak sync: untested paths, autosync, hook caching
-```
-
-instead of `knowledge: 2380 memories from MMI0122312`. If the model is slow, unavailable or
-returns nonsense, the sync still happens with a deterministic subject
-(`knowledge: 3 learnings, 1 decision`) — `--no-summarize` skips it entirely.
-
-A lockfile stops overlapping runs from fighting over the git index, and a lock older than
-30 minutes is treated as stale, so a killed run never wedges the daemon permanently.
-
-#### Deleting knowledge
-
-Import only ever merges, so deleting a memory locally is not enough — another machine still
-holding it pushes it straight back. Deletion therefore needs a tombstone:
-
-```bash
-python3 tools/jejak-sync.py forget 44925a40 --reason "was wrong about the pool size"
-```
-
-It shows what will go, asks for confirmation (`--yes` to skip), deletes locally, records the
-tombstone, strips the record from the shards, and pushes. Every other machine deletes it at
-its next `pull`, even one that never saw the original delete.
-
-```
-tombstones.jsonl
-{"deleted_at":"...","machine":"...","memory_id":"...","reason":"...","type":"finding"}
-```
-
-Tombstones are append-only and additive — writing them never truncates another machine's
-entries — and `push` applies them *before* collecting knowledge, so a machine that has not
-pulled yet cannot re-add what someone else deleted. `verify` reports the count and flags any
-tombstoned id that reappears in a shard as `RESURRECTED`.
-
-Most of the time you want `--supersedes` instead: it corrects an entry while keeping the
-history. Reserve `forget` for knowledge that should not exist at all. The content stays
-recoverable from git history either way.
-
-#### Making the repo dependable
-
-A sync tool you have to remember to run, that fails when another machine got there first,
-and that cannot tell you whether the stored data is intact, is not storage. Four properties
-close that gap.
-
-**1. It runs itself.** A `SessionEnd` hook (`jejak-autosync.py`) pushes when a session ends.
-Detached, so it never delays exit; a no-op unless a remote is configured; failures are logged,
-never raised, because a missed push is recoverable and a blocked session is not.
-
-**2. Push converges instead of failing.** A plain `git push` is rejected the moment another
-machine has pushed — leaving your knowledge committed locally and never stored. `push` now
-merges and retries (3 attempts). If a shard conflicts, it is re-derived from the union of both
-sides rather than hand-resolved. And because deletion only ever happens through tombstones, a
-repo record this machine has not pulled yet is kept, never erased by a push from the graph.
-
-**3. Integrity is checkable.** The manifest carries a SHA-256 and record count per shard:
-
-```bash
-python3 tools/jejak-sync.py verify
-```
-```
-  shards        : 256
-  records       : 2361  (manifest says 2361)
-  duplicate ids : 0
-
-  OK - every shard matches its checksum.
-```
-
-This catches the failure that matters most — a shard truncated at a *record boundary* is
-still valid JSON, so it would load fine while silently having lost knowledge. `verify`
-reports it as `CHANGED 05.jsonl (manifest 11 records, file has 2)`. Recovery is
-`git checkout -- knowledge/`, because every version is in git history.
-
-**4. Corruption is diagnosed, not tracebacked.** A malformed line is reported as
-`knowledge/07.jsonl:14: Unterminated string`, and in strict mode it *stops* the run — a
-store that silently drops records is worse than one that refuses to load.
-
-#### The private-repo gate
-
-```
-REFUSING: you/jejak-knowledge is PUBLIC.
-Your graph contains employer-internal detail. Make the repo private:
-    gh repo edit you/jejak-knowledge --visibility private
-```
-
-It also refuses when it *cannot verify* — a 404, or no token available — rather than
-failing open. Override with `--allow-unverified` only for a non-GitHub remote you trust.
-
-Failing closed nearly broke the automation: the `SessionEnd` hook has no `GITHUB_TOKEN` in
-its environment, so the gate refused every unattended push. Rather than weaken it to trust a
-verification recorded at setup time, the gate now asks `git credential fill` for the very
-credential git already uses to push. Nothing new is stored, and every push — attended or
-not — is still verified live against the API.
-
-> Measured on a real working graph: **42% of non-prompt memories contained
-> employer-internal detail** — service names, production config, ticket and MR numbers.
-> A public knowledge repo is a data leak, not a privacy preference.
-
-### What makes this safe
-
-| Concern | How it's handled |
-|---|---|
-| **Re-running** | `memory_id` is a UUID and is the merge key. Import is idempotent and order-independent — re-importing the same bundle writes nothing. |
-| **Two machines editing the same entry** | Newest `updated_at` wins. `superseded` is monotonic: once an entry is superseded anywhere, it stays superseded, so a correction is never silently undone. |
-| **Different usernames / layouts** | Project paths export as `~/`-relative and expand to the local `$HOME` on import, so `/Users/sam/dev/x` and `/home/sami/dev/x` stay one project instead of forking. |
-| **Bundle size** | `RELATES_TO` is *derived* from shared topics and outnumbers memories ~150:1 (558k edges for 3.7k memories on a real graph). It is never exported — it's rebuilt locally after import. A full knowledge base is a few hundred KB. |
-| **Scores** | `relevance_score` depends on hits, spread and connection count, all of which change when graphs merge. It is not exported; it's recomputed locally with the canonical formula. |
-| **Secrets** | Content is redacted on write *and* again on export. |
-| **Noise** | Raw prompt nodes are excluded by default (`--include-prompts` to keep them). |
-
-Partial exports, for sharing one project's knowledge with a teammate rather than your whole graph:
-
-```bash
-python3 tools/jejak-sync.py export --project ~/dev/myrepo
-python3 tools/jejak-sync.py export --since 2026-01-01
-```
-
-> The bundle is your knowledge in plaintext. If it covers proprietary work, move it the way
-> you'd move a database dump — not through a public repo.
+Bundles exclude prompts and links (links are rebuilt), and are redacted again on export.
+A bundle is your knowledge in plaintext: move it the way you'd move a database dump,
+never through a public repo.
 
 ## Security
 
-Jejak stores everything **locally**. Nothing is sent anywhere.
+- **Only the server touches Neo4j.** Neo4j listens on 127.0.0.1 (personal install) or
+  only inside the compose network (team server).
+- **Authentication.** argon2 password hashes; tokens are 32 random bytes and stored
+  only as sha256; tokens can expire and be revoked. Invite codes are single-use and
+  expire. Failed logins are throttled per user and per address.
+- **Authorization** happens on the server for every request. Every query is limited to
+  the caller's spaces; a test fails if a memory query isn't.
+- **Transport.** The client refuses to send a token over plain `http://` to another
+  machine. The team server gets HTTPS from Caddy automatically.
+- **Prompts stay on the device.** Hooks send only a prompt's detected topics. Raw
+  prompts are stored only by a personal server, and only from the same machine.
+- **Secrets are redacted before write**, on the client and again on the server:
+  `ghp_*`, `sk-*`, `AKIA*`, `xox*`, Jejak's own `jjk_`/`jji_`, `password:`/`token=`
+  assignments, and `user:pass@host` connection strings.
+- **Your knowledge is not in this repo.** This repo is the engine; the graph is yours.
 
-- **Secrets are redacted before write.** GitHub PATs (`ghp_*`), OpenAI keys (`sk-*`),
-  AWS keys (`AKIA*`), Slack tokens (`xox*`), `password:`/`token=` assignments, and
-  `user:pass@host` connection strings are scrubbed in `jejak_common.redact()` — applied
-  to prompts *and* extracted knowledge.
-- **`db-config.json` is gitignored** and `chmod 600`. Only the example ships.
-- **`serve-graph.py` binds to 127.0.0.1** and serves exactly one file — never the
-  hooks directory, which holds your credentials.
-- **Your knowledge never leaves your machine.** This repo is the engine; the graph
-  it builds is yours and is not part of it.
-
-> If you work on proprietary code, your graph will contain proprietary knowledge.
-> Back it up like a database, not like a notes folder — and never commit a dump.
+> If you work on proprietary code, your graph will contain proprietary knowledge. Host
+> the server where that knowledge is allowed to live, and back it up like a database.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. The codebase is small and deliberately dependency-light:
+Issues and PRs welcome.
 
 | File | Role |
 |---|---|
-| `hooks/jejak_common.py` | Shared helpers — config, redaction, topics, the one canonical scoring query |
+| `server/jejak_server/core.py` | Every command's queries, scoped to spaces — the only Cypher for knowledge |
+| `server/jejak_server/auth.py` | Users, tokens, invites, spaces, roles |
+| `server/jejak_server/app.py` | HTTP API and graph page |
+| `server/jejak_server/mcp_tools.py` | MCP over HTTP at `/mcp` |
+| `server/jejak_server/schema.py` | Schema and the pre-server migration |
+| `server/jejak_server/__main__.py` | `serve` and the `admin` CLI |
+| `hooks/jejak_common.py` | Redaction, topics, project identity, the one canonical scoring query |
+| `hooks/jejak_client.py` | Client config, HTTP, offline outbox |
+| `hooks/jejak-cli.py` | The `jejak` / `/jejak` command surface |
 | `hooks/jejak.py` | Session lifecycle hooks (start / prompt / end) |
-| `hooks/jejak-cli.py` | The `/jejak` command surface |
 | `hooks/jejak-extract.py` | `Stop` hook — headless extraction of what was learned |
 | `hooks/jejak-artifact.py` | `PostToolUse` hook — document & artifact indexing |
-| `hooks/prompt-logger.py` | MySQL prompt log |
-| `hooks/recap-cli.py` | `/recap` data collector |
-| `hooks/serve-graph.py` | Loopback server for the visualization |
-| `tools/bootstrap.py` | Merges hooks into `settings.json`, Jejak rules into `CLAUDE.md` |
-| `tools/apply_schema.py` | Applies the Neo4j + MySQL schema from `db-config.json` |
-| `tools/jejak-sync.py` | Export / import knowledge bundles between machines |
+| `hooks/jejak-mcp.py` | stdio MCP bridge |
+| `deploy/` | Dockerfile, docker-compose (Neo4j + server + Caddy), backups |
+| `tests/` | `cd server && uv run --group dev pytest ../tests` |
 
-One rule: **the scoring formula lives in `jejak_common.py` and nowhere else.** Hooks and
-CLI must both call it, or rankings drift apart.
+One rule: **the scoring formula lives in `jejak_common.py` and nowhere else.**
 
 ---
 

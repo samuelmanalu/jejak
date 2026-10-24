@@ -8,6 +8,7 @@ most callers are AI agents that act on what they are told.
 """
 import contextlib
 import ipaddress
+import re
 import os
 import json
 import threading
@@ -71,6 +72,15 @@ def resolve_project(s, spaces, key=None, name=None, directory=None):
     return key or (name.lower() if name else None), name
 
 
+_UNSAFE = re.compile(r"[^A-Za-z0-9._/@:+~ -]")
+
+
+def clean(text, limit=200):
+    """Client-chosen labels (project names and keys) are shown to other members
+    of a space, so only plain characters survive."""
+    return _UNSAFE.sub("", text)[:limit].strip() or None if text else None
+
+
 def build_ctx(s, p, c):
     """core.Ctx from the principal and the client's context block."""
     c = c or {}
@@ -80,12 +90,12 @@ def build_ctx(s, p, c):
             space = p.space_by_slug(c["space"])
         except auth.AccessError as e:
             raise ApiError(404, str(e), "jejak space list")
-    key, name = resolve_project(s, p.read_spaces, c.get("project_key"), c.get("project_name"),
-                                c.get("directory"))
+    key, name = resolve_project(s, p.read_spaces, clean(c.get("project_key")), clean(c.get("project_name")),
+                                clean(c.get("directory"), 400))
     return core.Ctx(username=p.username, read_spaces=p.read_spaces, write_spaces=p.write_spaces,
                     space=space, project_key=key, project_name=name or key,
-                    directory=c.get("directory"), machine=(c.get("machine") or "unknown")[:80],
-                    session=(c.get("session") or f"manual-{p.username}")[:120])
+                    directory=clean(c.get("directory"), 400), machine=clean(c.get("machine"), 80) or "unknown",
+                    session=clean(c.get("session"), 120) or f"manual-{p.username}")
 
 
 def run_command(p, command, args, client_ctx):
@@ -169,6 +179,12 @@ def create_app():
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
         resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         resp.headers.setdefault("Cache-Control", "no-store")
+        # The page's script is inline; nothing may load from or send to another origin.
+        resp.headers.setdefault("Content-Security-Policy",
+                                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                                "connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; "
+                                "form-action 'self'")
         return resp
 
     @app.get("/healthz")

@@ -1,13 +1,22 @@
 ---
 name: jejak
-description: "Jejak — save, search, map, rank, and browse linked knowledge across sessions and projects. Backed by Neo4j."
+description: "Jejak — save, search, map, rank, and browse linked knowledge across sessions, projects and team spaces, on a Jejak server."
 user-invocable: true
 keywords: [jejak, knowledge, graph, memory, remember, recall, save, map, search, rank, context, session, neo4j]
 ---
 
 # Jejak (jejak)
 
-Save, search, map, rank, and browse linked knowledge stored in Neo4j. Knowledge is automatically segregated by project directory, linked by shared topics, and ranked by a continuous relevance score.
+Save, search, map, rank, and browse linked knowledge on a Jejak server (Neo4j behind
+it). Knowledge is segregated by project and by space (personal or team), linked by
+shared topics, and ranked by a continuous relevance score.
+
+**Before anything else, if a command fails or this is a new machine, run
+`python3 ~/.claude/hooks/jejak-cli.py status`.** It reports the server, the login, the
+space and your role for this directory; every error ends with a `hint:` naming the
+fix. Never ask for or type a password yourself: a password login is the user's step
+(`! jejak login <url>`). Invite codes go on stdin (`--invite`), tokens only to files
+(`jejak token create <name> --file <path>`).
 
 ## Usage
 
@@ -29,11 +38,20 @@ Save, search, map, rank, and browse linked knowledge stored in Neo4j. Knowledge 
 /jejak delete <memory_id> -r <why>  Soft-delete (hidden everywhere, kept for audit)
 /jejak restore <memory_id>          Bring a deleted memory back as a new entry
 /jejak visibility <public|confidential> <id>...   Who may read it in a public graph view
+
+jejak status                        Is Jejak ready here? (server, login, space, role, queue)
+jejak whoami                        Your spaces and roles
+jejak space use <slug> [dir]        Send saves under a folder to a team space
+jejak space list | members <slug> | add-member <slug> <user> <role>
+jejak token create <name> --file F  Token for an MCP client (written to a file)
 ```
 
+Saves go to this directory's space (`jejak space use`) or your personal space; add
+`--space <slug>` to choose. A viewer can read a space but not save to it.
+
 Every memory is `confidential` unless marked `public` (`save ... --visibility public`
-or `visibility public <id>`). A public graph view (`serve-graph.py --public`) shows
-confidential memories only as anonymous nodes. Mark public only what is safe for
+or `visibility public <id>`). A space's public graph view (`jejak space public <slug> on`,
+then `https://<server>/s/<slug>`) shows confidential memories only as anonymous nodes. Mark public only what is safe for
 anyone to read; prompts always stay confidential.
 
 `delete` is for entries that are plainly wrong or that the user wants gone; to
@@ -280,9 +298,10 @@ Rewriting a document **supersedes** its previous version (only the latest is act
 
 ## Config
 
-Database config is at `~/.claude/hooks/db-config.json` (chmod 600). Neo4j runs on `bolt://localhost:7687`.
+The client's server URL and token are in `~/.jejak/client.json` (chmod 600); never print
+or copy the token. Saves made while the server is unreachable wait in `~/.jejak/outbox/`
+and are sent by the next command.
 
 ## Visualization
 
-- Neo4j Browser: http://localhost:7474
-- Knowledge Graph Observatory: http://localhost:8787/jejak.html
+The graph page is the server's root URL (`http://127.0.0.1:7700` for a personal install).

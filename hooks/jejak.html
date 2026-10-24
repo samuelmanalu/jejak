@@ -710,16 +710,16 @@
       const col = getTypeColor(t);
       const checked = visibleTypes.has(t) ? 'checked' : '';
       html += `<label>
-        <input type="checkbox" data-type="${t}" ${checked} style="border-color:${col}"/>
+        <input type="checkbox" data-type="${escapeHtml(t)}" ${checked} style="border-color:${col}"/>
         <span class="type-dot" style="background:${col}"></span>
-        ${t}
+        ${escapeHtml(t)}
       </label>`;
     });
     html += '<div class="filter-heading" style="margin-top:8px">Project</div>';
     html += '<select id="project-filter"><option value="">All projects</option>';
     allProjects.forEach(p => {
       const sel = (p === filterProject) ? 'selected' : '';
-      html += `<option value="${p}" ${sel}>${p}</option>`;
+      html += `<option value="${escapeHtml(p)}" ${sel}>${escapeHtml(p)}</option>`;
     });
     html += '</select>';
     html += '<button class="relayout-btn" id="fit-btn" title="Shortcut: F">Fit map to screen</button>';
@@ -1195,7 +1195,7 @@
     const connectedIds = connectedEdges.map(e => e.source === node.id ? e.target : e.source);
 
     let html = '';
-    html += `<div class="detail-section"><div class="detail-label">ID</div><div class="detail-id">${node.id}</div></div>`;
+    html += `<div class="detail-section"><div class="detail-label">ID</div><div class="detail-id">${escapeHtml(node.id)}</div></div>`;
     if (node.confidential) {
       // The server sent no content, topics, projects or sessions for this node.
       html += `<div class="detail-section"><div class="detail-label">Content</div><div class="detail-content">Confidential. This knowledge exists in the graph, but its details are not public.</div></div>`;
@@ -1221,7 +1221,7 @@
         if (!cn) return;
         const cc = getTypeColor(cn.type);
         const preview = cn.content.length > 50 ? cn.content.substring(0, 50) + '...' : cn.content;
-        html += `<div class="connection-item" data-nav="${cid}"><span class="connection-dot" style="background:${cc}"></span>${cid} <span style="color:var(--text-muted);margin-left:auto;font-size:10px;text-transform:uppercase">${cn.type}</span></div>`;
+        html += `<div class="connection-item" data-nav="${cid}"><span class="connection-dot" style="background:${cc}"></span>${escapeHtml(cid)} <span style="color:var(--text-muted);margin-left:auto;font-size:10px;text-transform:uppercase">${escapeHtml(cn.type)}</span></div>`;
       });
       html += '</div>';
     }
@@ -1248,13 +1248,13 @@
   }
 
   function escapeHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   }
 
   // ===== TOOLTIP =====
   function showTooltip(node, mx, my) {
     const col = getTypeColor(node.type);
-    tooltip.innerHTML = `${node.id} <span class="tt-type" style="color:${col}">${node.type}</span>` +
+    tooltip.innerHTML = `${escapeHtml(node.id)} <span class="tt-type" style="color:${col}">${escapeHtml(node.type)}</span>` +
       (node.confidential ? ' <span class="tt-type">confidential</span>' : '');
     tooltip.style.left = (mx + 14) + 'px';
     tooltip.style.top = (my - 10) + 'px';

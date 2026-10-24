@@ -364,6 +364,11 @@ def parser():
     us.add_argument("--role", default="viewer", choices=["viewer", "editor", "owner"])
     us.add_argument("--admin", action="store_true")
     us.add_argument("--hours", type=int, default=24)
+    # Agents write `jejak status --json` as often as `jejak --json status`: accept both.
+    targets = [sp for n, sp in sub.choices.items() if n in ("status", "whoami", "token", "user")]
+    targets += list(ssub.choices.values())
+    for sp in targets:
+        sp.add_argument("--json", dest="as_json", action="store_true", default=argparse.SUPPRESS)
     return p
 
 

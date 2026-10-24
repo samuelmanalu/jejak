@@ -1,10 +1,11 @@
 <!-- JEJAK:BEGIN - managed by install.sh, edits between these markers are overwritten -->
 # Jejak — Always Active
 
-You have a Jejak knowledge-graph system backed by Neo4j. It is the **single interface**
-for engineering knowledge on this machine: everything added, updated, or looked up goes
-through the `/jejak` skill. Never write to Neo4j directly, and never keep a parallel
-notes file for what belongs in the graph.
+You have a Jejak knowledge graph, served by a Jejak server this machine is signed in to.
+It is the **single interface** for engineering knowledge: everything added, updated, or
+looked up goes through the `/jejak` skill. Never write to the database directly, and
+never keep a parallel notes file for what belongs in the graph. If a Jejak command fails,
+run `jejak status` and follow its `hint:`; never type a password or print a token.
 
 ## 1. ADD — Auto-Save Rule
 
