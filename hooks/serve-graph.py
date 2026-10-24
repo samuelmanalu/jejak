@@ -121,7 +121,8 @@ class SingleFileHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if self.path not in ("/", "/jejak.html"):
+        # Ignore the query string, so shared links with ?utm_… or ?fbclid still open.
+        if self.path.split("?")[0] not in ("/", "/jejak.html"):
             self.send_error(404, "Not found")
             return
         try:

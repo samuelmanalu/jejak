@@ -256,7 +256,10 @@ The map is static. The layout runs once (seconds, in the background, even if the
 is hidden), then stops and is remembered in the browser, so reopening the page shows
 the same map instantly. New knowledge appears next to a linked bubble without
 disturbing the rest. A dragged bubble stays where you drop it. Press `L` to lay the
-map out again.
+map out again, `F` to fit it to the screen.
+
+It works on phones: drag to pan, pinch to zoom, tap a bubble for its details in a
+bottom sheet; filters sit behind a Filters button.
 
 #### Public view: share the map, keep the details
 

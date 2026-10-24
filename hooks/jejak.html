@@ -1,3 +1,7 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Jejak Observatory</title>
 <style>
   :root {
@@ -124,6 +128,7 @@
     overflow: hidden;
     width: 100vw;
     height: 100vh;
+    height: 100dvh;
     position: relative;
   }
 
@@ -133,6 +138,7 @@
     width: 100%;
     height: 100%;
     cursor: grab;
+    touch-action: none;  /* pan and pinch are handled by the page, not the browser */
   }
   #graph-canvas.grabbing { cursor: grabbing; }
   #graph-canvas.pointer { cursor: pointer; }
@@ -229,6 +235,7 @@
     flex-direction: column;
     gap: 6px;
     min-width: 170px;
+    max-width: 220px;   /* long project names would otherwise widen the dropdown */
     box-shadow: 0 4px 16px var(--shadow);
   }
   .filter-panel .filter-heading {
@@ -287,6 +294,7 @@
     outline: none;
     cursor: pointer;
   }
+  .filter-panel select { width: 100%; max-width: 100%; text-overflow: ellipsis; }
   .filter-panel select:focus { border-color: var(--c-decision); }
 
   /* ---------- Sidebar ---------- */
@@ -339,6 +347,81 @@
   .sidebar-header .close-btn:hover {
     background: var(--bg-surface);
     color: var(--text-primary);
+  }
+
+  /* Filters button: only on small screens, where the panel starts closed. */
+  .filter-toggle {
+    display: none;
+    padding: 6px 10px;
+    background: var(--search-bg);
+    border: 1px solid var(--search-border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .relayout-btn {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .relayout-btn + .relayout-btn { margin-top: 4px; }
+  .relayout-btn:hover { color: var(--text-primary); }
+
+  /* ---------- Phones ---------- */
+  @media (max-width: 640px) {
+    .top-bar {
+      padding: 8px 10px;
+      padding-top: max(8px, env(safe-area-inset-top));
+      gap: 8px;
+    }
+    .search-wrap { flex: 1 1 auto; min-width: 0; }
+    .search-wrap input { font-size: 16px; }  /* iOS zooms into inputs under 16px */
+    .filter-toggle { display: block; }
+    .stats {
+      width: 100%;
+      margin-left: 0;
+      gap: 12px;
+      font-size: 11px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .filter-panel {
+      display: none;
+      top: calc(92px + env(safe-area-inset-top));
+      left: 10px;
+      right: 10px;
+      max-width: none;
+      max-height: calc(100dvh - 120px);
+      overflow-y: auto;
+    }
+    .filter-panel.open { display: flex; }
+    .filter-panel label { padding: 6px 0; font-size: 14px; }
+    .filter-panel input[type="checkbox"] { width: 18px; height: 18px; }
+    .filter-panel select { font-size: 16px; padding: 6px; }
+    /* The details panel becomes a bottom sheet over the lower part of the map. */
+    .sidebar {
+      top: auto;
+      left: 0;
+      width: 100%;
+      max-width: 100%;
+      height: 60dvh;
+      border-left: none;
+      border-top: 1px solid var(--border);
+      border-radius: 14px 14px 0 0;
+      transform: translateY(100%);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .sidebar.open { transform: translateY(0); }
+    .sidebar-header .close-btn { width: 40px; height: 40px; font-size: 24px; }
+    .tooltip { display: none; }
   }
 
   .sidebar-body {
@@ -463,6 +546,7 @@
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
     <input type="text" id="search-input" placeholder="Search nodes..." spellcheck="false" />
   </div>
+  <button class="filter-toggle" id="filter-toggle" aria-controls="filter-panel" aria-expanded="false">Filters</button>
   <div class="stats" id="stats-bar"></div>
 </div>
 
@@ -534,6 +618,32 @@
 
   // Camera
   let camX = 0, camY = 0, camZoom = 1;
+  const MIN_ZOOM = 0.03, MAX_ZOOM = 5;
+  let cameraTouched = false;   // once the user pans or zooms, stop auto-fitting
+
+  // Frame the visible bubbles, below the top bar, on any screen size.
+  function fitView() {
+    const vis = getVisibleNodes();
+    if (!vis.length) return;
+    // Frame the dense core, not the sparse halo of weakly linked bubbles around
+    // it (up to half of them), which would shrink the core to a dot. Centre on
+    // the inner half of the bubbles and size the frame to hold them, plus margin.
+    const med = arr => arr.slice().sort((a, b) => a - b)[arr.length >> 1];
+    let cx = med(vis.map(n => n.x)), cy = med(vis.map(n => n.y));
+    const inner = r => vis.filter(n => Math.hypot(n.x - cx, n.y - cy) <= r);
+    let ds = vis.map(n => Math.hypot(n.x - cx, n.y - cy)).sort((a, b) => a - b);
+    const core = inner(ds[ds.length >> 1]);
+    cx = core.reduce((a, n) => a + n.x, 0) / core.length;
+    cy = core.reduce((a, n) => a + n.y, 0) / core.length;
+    ds = vis.map(n => Math.hypot(n.x - cx, n.y - cy)).sort((a, b) => a - b);
+    const radius = Math.max(50, 1.15 * ds[ds.length >> 1]);
+    const top = document.querySelector('.top-bar').offsetHeight;
+    const w = window.innerWidth - 24, h = window.innerHeight - top - 24;
+    camZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(w, h) / (2 * radius)));
+    camX = cx;
+    camY = cy - top / 2 / camZoom;   // centre in the area under the bar
+  }
+
   let isDragging = false, dragStartX = 0, dragStartY = 0, camStartX = 0, camStartY = 0;
   let draggedNode = null;
 
@@ -583,7 +693,14 @@
       html += `<option value="${p}" ${sel}>${p}</option>`;
     });
     html += '</select>';
+    html += '<button class="relayout-btn" id="fit-btn" title="Shortcut: F">Fit map to screen</button>';
+    html += '<button class="relayout-btn" id="relayout-btn" title="Shortcut: L">Lay out the map again</button>';
     filterPanel.innerHTML = html;
+    document.getElementById('relayout-btn').addEventListener('click', relayout);
+    document.getElementById('fit-btn').addEventListener('click', () => {
+      fitView();
+      filterPanel.classList.remove('open');
+    });
 
     filterPanel.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       const t = cb.dataset.type;
@@ -708,6 +825,7 @@
     movable = new Set();
     NODES.forEach(n => { n.vx = 0; n.vy = 0; });
     saveLayout();
+    if (!cameraTouched) fitView();
   }
 
   function relayout() {
@@ -1022,7 +1140,7 @@
   }
 
   // ===== HIT TESTING =====
-  function hitTest(mx, my) {
+  function hitTest(mx, my, slop = 4) {
     const [wx, wy] = screenToWorld(mx, my);
     const visIds = new Set(getVisibleNodes().map(n => n.id));
     let closest = null, closestDist = Infinity;
@@ -1030,7 +1148,7 @@
       if (!visIds.has(n.id)) return;
       const dx = n.x - wx, dy = n.y - wy;
       const d = Math.sqrt(dx * dx + dy * dy);
-      const r = nodeRadius(n) / camZoom + 4;
+      const r = nodeRadius(n) + slop / camZoom;  // world units; slop is screen pixels
       if (d < r && d < closestDist) { closest = n; closestDist = d; }
     });
     return closest;
@@ -1142,6 +1260,7 @@
       draggedNode.vx = 0;
       draggedNode.vy = 0;
     } else if (isDragging) {
+      cameraTouched = true;
       const dx = (e.clientX - dragStartX) / camZoom;
       const dy = (e.clientY - dragStartY) / camZoom;
       camX = camStartX - dx;
@@ -1178,7 +1297,8 @@
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     const zoomFactor = e.deltaY > 0 ? 0.92 : 1.08;
-    const newZoom = Math.max(0.15, Math.min(5, camZoom * zoomFactor));
+    cameraTouched = true;
+    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camZoom * zoomFactor));
     // Zoom toward cursor
     const [wx, wy] = screenToWorld(e.clientX, e.clientY);
     camZoom = newZoom;
@@ -1187,61 +1307,86 @@
     camY += (sy2 - e.clientY) / camZoom;
   }, { passive: false });
 
-  // Touch support
-  let lastTouchDist = 0;
+  // Touch: one finger pans, two fingers pinch-zoom around the fingers, a tap
+  // opens a bubble (with a finger-sized hit area) or closes the panel. Bubbles
+  // are not dragged by touch, so a shaky tap never moves the map.
+  const TAP_SLOP = 10;     // px a finger may move and still count as a tap
+  const TOUCH_HIT = 16;    // px around a bubble that still hits it
+  let touchMoved = false, tapX = 0, tapY = 0, pinchDist = 0, pinchMidX = 0, pinchMidY = 0;
+
+  function startPan(t) {
+    isDragging = true;
+    dragStartX = t.clientX; dragStartY = t.clientY;
+    camStartX = camX; camStartY = camY;
+  }
+  function pinchState(e) {
+    const a = e.touches[0], b = e.touches[1];
+    return [Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+            (a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2];
+  }
+
   canvas.addEventListener('touchstart', e => {
+    filterPanel.classList.remove('open');   // touching the map closes the filters (phones)
     if (e.touches.length === 1) {
-      const t = e.touches[0];
-      const node = hitTest(t.clientX, t.clientY);
-      if (node) {
-        draggedNode = node;
-      } else {
-        isDragging = true;
-        dragStartX = t.clientX;
-        dragStartY = t.clientY;
-        camStartX = camX;
-        camStartY = camY;
-      }
+      touchMoved = false;
+      tapX = e.touches[0].clientX; tapY = e.touches[0].clientY;
+      startPan(e.touches[0]);
     } else if (e.touches.length === 2) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      lastTouchDist = Math.sqrt(dx * dx + dy * dy);
+      touchMoved = true;   // a pinch is never a tap
+      isDragging = false;
+      [pinchDist, pinchMidX, pinchMidY] = pinchState(e);
     }
     e.preventDefault();
   }, { passive: false });
 
   canvas.addEventListener('touchmove', e => {
-    if (e.touches.length === 1) {
+    if (e.touches.length === 1 && isDragging) {
       const t = e.touches[0];
-      if (draggedNode) {
-        const [wx, wy] = screenToWorld(t.clientX, t.clientY);
-        draggedNode.x = wx; draggedNode.y = wy;
-        draggedNode.vx = 0; draggedNode.vy = 0;
-      } else if (isDragging) {
-        const dx = (t.clientX - dragStartX) / camZoom;
-        const dy = (t.clientY - dragStartY) / camZoom;
-        camX = camStartX - dx;
-        camY = camStartY - dy;
-      }
-    } else if (e.touches.length === 2) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (lastTouchDist > 0) {
-        camZoom = Math.max(0.15, Math.min(5, camZoom * (dist / lastTouchDist)));
-      }
-      lastTouchDist = dist;
+      if (Math.hypot(t.clientX - tapX, t.clientY - tapY) > TAP_SLOP) touchMoved = cameraTouched = true;
+      camX = camStartX - (t.clientX - dragStartX) / camZoom;
+      camY = camStartY - (t.clientY - dragStartY) / camZoom;
+    } else if (e.touches.length === 2 && pinchDist > 0) {
+      const [dist, midX, midY] = pinchState(e);
+      // Keep the world point under the fingers' midpoint under it while zooming,
+      // and move with the midpoint so two fingers can also pan.
+      const [wx, wy] = screenToWorld(pinchMidX, pinchMidY);
+      cameraTouched = true;
+      camZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camZoom * (dist / pinchDist)));
+      camX = wx - (midX - window.innerWidth / 2) / camZoom;
+      camY = wy - (midY - window.innerHeight / 2) / camZoom;
+      pinchDist = dist; pinchMidX = midX; pinchMidY = midY;
     }
     e.preventDefault();
   }, { passive: false });
 
   canvas.addEventListener('touchend', e => {
-    if (draggedNode) { openSidebar(draggedNode); draggedNode = null; saveLayout(); }
+    if (e.touches.length === 1) {
+      // One finger lifted from a pinch: continue as a pan from where it is.
+      pinchDist = 0;
+      startPan(e.touches[0]);
+      return;
+    }
+    if (e.touches.length > 0) return;
     isDragging = false;
-    lastTouchDist = 0;
+    pinchDist = 0;
+    if (touchMoved) return;
+    const node = hitTest(tapX, tapY, TOUCH_HIT);
+    if (!node) { closeSidebar(); return; }
+    openSidebar(node);
+    if (window.innerWidth <= 640) {
+      // Keep the bubble visible above the bottom sheet.
+      camX = node.x;
+      camY = node.y + (window.innerHeight * 0.25) / camZoom;
+    }
   });
 
   sidebarClose.addEventListener('click', closeSidebar);
+
+  const filterToggle = document.getElementById('filter-toggle');
+  filterToggle.addEventListener('click', () => {
+    const open = filterPanel.classList.toggle('open');
+    filterToggle.setAttribute('aria-expanded', String(open));
+  });
 
   searchInput.addEventListener('input', e => {
     searchQuery = e.target.value.trim();
@@ -1253,6 +1398,7 @@
     if (e.key === 'Escape') { closeSidebar(); searchInput.blur(); searchQuery = ''; searchInput.value = ''; }
     if (e.key === '/' && document.activeElement !== searchInput) { e.preventDefault(); searchInput.focus(); }
     if ((e.key === 'l' || e.key === 'L') && document.activeElement !== searchInput) relayout();
+    if ((e.key === 'f' || e.key === 'F') && document.activeElement !== searchInput) fitView();
   });
 
   // ===== LOOP =====
@@ -1359,6 +1505,7 @@
 
     if (isFirstLoad) {
       visibleTypes = new Set(allTypes);
+      if (!cameraTouched) fitView();
     } else {
       // Keep the user's filter choices; just make sure any newly-appeared type
       // is visible by default.
