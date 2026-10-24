@@ -12,17 +12,48 @@ root causes worth keeping as a knowledge graph and brings the most relevant ones
 the next time you work in that project, whichever agent you use.
 
 Jejak works like a database server. Installing it gives you a **Jejak server** (Neo4j
-included). Everything else is a **client** that signs in with a token: the Claude Code
-hooks, the `jejak` CLI, and any MCP client. Run the server on your laptop for yourself,
-or on a VPS for a team, with users, shared spaces and roles.
+included). Everything else is a **client** that has to sign in: the Claude Code hooks,
+the `jejak` CLI, and any MCP client. Run the server on your laptop for yourself, or on a
+VPS for a team, with users, shared spaces and roles.
 
-- **Claude Code** gets the full, automatic version: hooks extract what was learned in
+- **Any AI agent** (Claude, Gemini CLI, Cursor, Antigravity, …) gets the server's address
+  and nothing else. The first time it connects, it opens your browser on the Jejak
+  server; you sign in and click Allow. It then has full create/read/update/delete,
+  limited to your spaces and your role.
+- **Claude Code** also gets the automatic version: hooks extract what was learned in
   each session and load the right knowledge back into context on their own.
-- **Any MCP client** connects to `https://<server>/mcp` with a token, with nothing to
-  install, and gets full create/read/update/delete.
 
 No manual note-taking. No `NOTES.md` that goes stale. The graph decides what matters
 by scoring what you actually keep coming back to.
+
+---
+
+## Quick start
+
+**Just me, on this laptop:**
+
+```bash
+git clone https://github.com/samuelmanalu/jejak.git && cd jejak && ./install.sh
+jejak status
+```
+
+**A server for my team** (on a VPS with Docker and a domain name):
+
+```bash
+cd jejak/deploy && cp .env.example .env    # set JEJAK_DOMAIN and NEO4J_PASSWORD
+docker compose up -d
+docker compose run --rm jejak admin init --admin <you>     # prints your invite code
+```
+
+**Adding a teammate and their AI agent:**
+
+```bash
+jejak user create rani --space my-team --role editor    # you: prints a one-time invite code
+```
+
+Rani gives her agent `https://jejak.example.com/mcp`. Her browser opens, she enters the
+invite code, chooses a password and clicks Allow. That's all; no token to copy. For the
+automatic Claude Code hooks as well: `./install.sh --client https://jejak.example.com`.
 
 ---
 
@@ -196,10 +227,15 @@ entries into someone else's agent context.) Server admins add members directly.
 Reads cover every space you belong to; saves go to your default (personal) space unless
 `jejak space use` or `--space` says otherwise. Knowledge is never linked across spaces.
 
-**Signing in.** New users get a single-use invite code instead of a password or a
-long-lived token; MCP apps sign in through the browser (see below). If the code ends up in a chat transcript, it is useless once it has
-been used or has expired. The first sign-in through an MCP app's browser page uses
-the invite code and sets a password (or `jejak login --invite`, then `jejak password`). Scripts and CI use tokens:
+**Signing in.** New users get a single-use invite code (valid 24 hours) instead of a
+password or a long-lived token. If the code ends up in a chat transcript, it is useless
+once it has been used or has expired. They redeem it either:
+
+- the first time an MCP app opens the browser sign-in page, where they also choose a
+  password; or
+- with `jejak login <url> --invite`, then `jejak password`.
+
+Scripts and CI use personal tokens:
 
 ```bash
 jejak token create gemini --file ~/.jejak/gemini.token    # written to a file, never printed
@@ -241,9 +277,9 @@ jejak save learning "Disbursal uses LAZY fetch to prevent OOM" \
 
 ### For AI agents
 
-- `jejak status` (add `--json` before the command for JSON: `jejak --json status`)
-  reports the server, the login, the space and role for the current directory, and
-  queued offline saves. It exits non-zero with a `hint:` when something needs fixing.
+- `jejak status` (add `--json` for JSON, before or after the command) reports the
+  server, the login, the space and role for the current directory, pending invitations,
+  and queued offline saves. It exits non-zero with a `hint:` when something needs fixing.
 - Every error is `error: …` plus `hint: <command that fixes it>` on stderr. HTTP
   errors are `{"error": …, "hint": …}`.
 - Nothing prompts for input except a password login, which is for the human:
@@ -282,10 +318,15 @@ How the sign-in is protected (standard OAuth 2.1 for MCP):
 
 - **PKCE (S256) is required**, so a stolen authorization code is useless without the
   client's secret verifier.
-- **Codes only go to your own machine.** Apps may register `http://127.0.0.1`/`localhost`
-  addresses (any port) or app links (`cursor://…`). Websites are allowed only for
-  allowlisted callbacks (`JEJAK_OAUTH_REDIRECT_ALLOWLIST`; Claude's by default). A
-  phishing site cannot register itself to receive your code.
+- **Codes only go to your own machine.** Apps may register:
+  - `http://127.0.0.1` or `localhost` addresses (any port);
+  - reverse-DNS app links (`com.example.app:/callback`);
+  - Cursor's own callback.
+
+  Websites are allowed only for allowlisted callbacks (`JEJAK_OAUTH_REDIRECT_ALLOWLIST`;
+  Claude's by default). App links that hand the address to a browser or Office
+  (`microsoft-edge:https://…` and similar) are refused, so a phishing site cannot get a
+  code sent to it.
 - **Codes are single-use and live 60 seconds.** Using one twice revokes everything it
   produced.
 - **Access tokens live 1 hour; refresh tokens are replaced on every use.** If an old
@@ -295,8 +336,12 @@ How the sign-in is protected (standard OAuth 2.1 for MCP):
 - **The consent page** is protected against forged submissions (a strict cookie plus a
   form token) and against being shown inside another site. It runs no script, escapes
   everything an app says about itself, and states in plain words where access goes.
-- **Rate limits** on `/register`, `/authorize`, `/token` and `/revoke`; password and
-  invite attempts are throttled per user and per address.
+- **Rate limits** on `/register`, `/authorize`, `/token` and `/revoke`, per network and
+  server-wide. Password and invite attempts are throttled per network and per account,
+  and a network you have signed in from before is never locked out of your account.
+- **Reviewed adversarially.** An independent review attacked this code. Every finding was
+  fixed (see the git history) and is covered by `tests/test_oauth.py` and
+  `tests/test_server.py`.
 
 Personal access tokens still work, for scripts, CI and clients without OAuth:
 
@@ -354,7 +399,6 @@ short end-of-day report:
 /recap --days 7 --detail
 ```
 
-
 `/recap` reads Neo4j and the MySQL prompt log directly, so it runs on the machine that
 hosts the server (a personal install).
 
@@ -370,7 +414,7 @@ the hosts:
 ```bash
 python3 tools/jejak-sync.py export --project ~/dev/myrepo -o myrepo.jsonl.gz    # source host
 python3 tools/jejak-sync.py import myrepo.jsonl.gz                             # target host
-python3 -m jejak_server admin migrate --owner <user>   # put the imported entries in a space
+python -m jejak_server admin migrate --owner <user>    # on the server: put them in a space
 ```
 
 Bundles exclude prompts and links (links are rebuilt), and are redacted again on export.
@@ -391,13 +435,16 @@ never through a public repo.
 - **Abuse limits.** Request bodies are capped at 1 MiB, and saved knowledge at 50,000
   characters. Redaction patterns are bounded, so no input can make them run for minutes.
 - **Authorization** happens on the server for every request. Every query is limited to
-  the caller's spaces; a test fails if a memory query isn't.
+  the caller's spaces; a test fails if a memory query isn't. Tokens carry scopes (read,
+  write, admin) on top of space roles, and the browser page uses a read-only token.
+- **Membership is consent-based.** An owner can only invite; the space stays invisible
+  until the invited user accepts.
 - **Transport.** The client refuses to send a token over plain `http://` to another
   machine. The team server gets HTTPS from Caddy automatically.
 - **Prompts stay on the device.** Hooks send only a prompt's detected topics. Raw
   prompts are stored only by a personal server, and only from the same machine.
 - **Secrets are redacted before write**, on the client and again on the server:
-  `ghp_*`, `sk-*`, `AKIA*`, `xox*`, Jejak's own `jjk_`/`jji_`, `password:`/`token=`
+  `ghp_*`, `sk-*`, `AKIA*`, `xox*`, Jejak's own `jjk_`/`jji_`/`jja_`/`jjr_`, `password:`/`token=`
   assignments, and `user:pass@host` connection strings.
 - **Your knowledge is not in this repo.** This repo is the engine; the graph is yours.
 
@@ -413,9 +460,11 @@ Issues and PRs welcome.
 | File | Role |
 |---|---|
 | `server/jejak_server/core.py` | Every command's queries, scoped to spaces — the only Cypher for knowledge |
-| `server/jejak_server/auth.py` | Users, tokens, invites, spaces, roles |
+| `server/jejak_server/auth.py` | Users, passwords, tokens, scopes, invites, spaces, roles, throttling |
 | `server/jejak_server/app.py` | HTTP API and graph page |
-| `server/jejak_server/mcp_tools.py` | MCP over HTTP at `/mcp` |
+| `server/jejak_server/mcp_tools.py` | MCP over HTTP at `/mcp`, rate limits |
+| `server/jejak_server/oauth.py` | OAuth 2.1 for MCP clients: registration policy, codes, grants, refresh rotation |
+| `server/jejak_server/consent.py` | The browser sign-in and approval page |
 | `server/jejak_server/schema.py` | Schema and the pre-server migration |
 | `server/jejak_server/__main__.py` | `serve` and the `admin` CLI |
 | `hooks/jejak_common.py` | Redaction, topics, project identity, the one canonical scoring query |
@@ -426,7 +475,7 @@ Issues and PRs welcome.
 | `hooks/jejak-artifact.py` | `PostToolUse` hook — document & artifact indexing |
 | `hooks/jejak-mcp.py` | stdio MCP bridge |
 | `deploy/` | Dockerfile, docker-compose (Neo4j + server + Caddy), backups |
-| `tests/` | `cd server && uv run --group dev pytest ../tests` |
+| `tests/` | `cd server && uv run --group dev pytest ../tests` (integration tests need a throwaway Neo4j; see the file header) |
 
 One rule: **the scoring formula lives in `jejak_common.py` and nowhere else.**
 
