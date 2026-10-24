@@ -63,6 +63,10 @@ def admin(args):
             if args.token_file:
                 _write_secret(args.token_file, auth.create_token(s, uid, args.token_name))
                 print(f"Wrote a token to {args.token_file} (chmod 600).")
+            else:
+                code = auth.create_invite(s, uid, "admin-init", 24)
+                print(f"Single-use invite code (valid 24 h):\n{code}\n"
+                      "On your machine run: jejak login <this-server-url> --invite   and paste it.")
             if left:
                 print(f"This database has {left} projects/sessions from before the server. "
                       f"Run: python -m jejak_server admin migrate --owner {args.admin}")
@@ -202,6 +206,8 @@ def main():
         import uvicorn
         from .app import create_app
         s = settings()
+        with driver().session() as db:
+            schema.apply(db)   # idempotent: a fresh database is ready at first start
         uvicorn.run(create_app(), host=args.host or s["host"], port=args.port or s["port"],
                     proxy_headers=True, forwarded_allow_ips=os.environ.get("JEJAK_TRUSTED_PROXIES", "127.0.0.1"),
                     log_level="warning", access_log=False)

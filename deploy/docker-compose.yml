@@ -1,0 +1,55 @@
+# Jejak team server: Neo4j (private) + jejak-server + Caddy (automatic HTTPS).
+#
+#   cp .env.example .env        # set JEJAK_DOMAIN and NEO4J_PASSWORD
+#   docker compose up -d
+#   docker compose run --rm jejak admin init --admin <you>  # prints your invite code
+#   jejak login https://$JEJAK_DOMAIN --invite              # on your laptop
+#
+# Only Caddy publishes ports. Neo4j and the Jejak server are reachable only
+# inside this compose network.
+services:
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$$NEO4J_PASSWORD\" 'RETURN 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  jejak:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      JEJAK_NEO4J_URI: bolt://neo4j:7687
+      JEJAK_NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      JEJAK_TRUSTED_PROXIES: "*"     # only Caddy can reach this container
+      JEJAK_ACCEPT_PROMPTS: "0"      # a shared server never stores raw prompts
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    command: caddy reverse-proxy --from ${JEJAK_DOMAIN:?set JEJAK_DOMAIN in .env} --to jejak:7700
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+    depends_on:
+      - jejak
+
+volumes:
+  neo4j-data:
+  caddy-data:

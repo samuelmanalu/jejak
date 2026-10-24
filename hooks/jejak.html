@@ -536,6 +536,23 @@
     stroke-width: 1.5;
     opacity: 0.5;
   }
+  /* ===== Account and login (served by a Jejak server) ===== */
+  .account { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+  .account select, .account button { background: var(--search-bg); border: 1px solid var(--search-border);
+    border-radius: 6px; color: var(--text-secondary); font: inherit; font-size: 12px; padding: 4px 6px; cursor: pointer; }
+  .login { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+    background: rgba(5, 8, 15, 0.85); padding: 16px; }
+  .login[hidden] { display: none; }
+  .login form { width: 100%; max-width: 320px; display: flex; flex-direction: column; gap: 10px;
+    background: var(--sidebar-bg, #0f1420); border: 1px solid var(--search-border); border-radius: 10px; padding: 20px; }
+  .login h2 { margin: 0 0 4px; font-size: 16px; color: var(--text-primary, #e6e6e6); }
+  .login input { background: var(--search-bg); border: 1px solid var(--search-border); border-radius: 6px;
+    color: var(--text-primary, #e6e6e6); font: inherit; font-size: 16px; padding: 9px 10px; }
+  .login button { background: #3b82f6; border: 0; border-radius: 6px; color: #fff; font: inherit; font-size: 15px;
+    padding: 10px; cursor: pointer; }
+  .login .note { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+  .login .err { font-size: 13px; color: #f87171; min-height: 1em; }
+  @media (max-width: 640px) { .account .who { display: none; } }
 </style>
 
 <canvas id="graph-canvas"></canvas>
@@ -548,6 +565,18 @@
   </div>
   <button class="filter-toggle" id="filter-toggle" aria-controls="filter-panel" aria-expanded="false">Filters</button>
   <div class="stats" id="stats-bar"></div>
+  <div class="account" id="account" hidden></div>
+</div>
+
+<div class="login" id="login" hidden>
+  <form id="login-form" autocomplete="on">
+    <h2>Sign in to Jejak</h2>
+    <input id="login-user" name="username" autocomplete="username" placeholder="Username" required>
+    <input id="login-pass" name="password" type="password" autocomplete="current-password" placeholder="Password" required>
+    <div class="err" id="login-err" role="alert"></div>
+    <button type="submit">Sign in</button>
+    <div class="note">No password yet? Set one in a terminal with <code>jejak password</code>.</div>
+  </form>
 </div>
 
 <div class="filter-panel" id="filter-panel"></div>
@@ -639,7 +668,7 @@
     const radius = Math.max(50, 1.15 * ds[ds.length >> 1]);
     const top = document.querySelector('.top-bar').offsetHeight;
     const w = window.innerWidth - 24, h = window.innerHeight - top - 24;
-    camZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(w, h) / (2 * radius)));
+    camZoom = Math.max(MIN_ZOOM, Math.min(1.5, Math.min(w, h) / (2 * radius)));
     camX = cx;
     camY = cy - top / 2 / camZoom;   // centre in the area under the bar
   }
@@ -1441,7 +1470,7 @@
   }
 
   // ===== DYNAMIC DATA LOADING =====
-  // No static snapshot. Everything comes live from /data.json, and the page
+  // No static snapshot. Everything comes live from the Jejak server, and the page
   // polls for changes so new knowledge appears without a manual reload.
 
   const REFRESH_MS = 10000;
@@ -1527,9 +1556,89 @@
 
   let knownTypes = new Set();
 
+  // ===== SERVER, LOGIN AND SPACES =====
+  // /s/<space> is a space's public view (no login; confidential entries arrive
+  // blank). Everywhere else the page signs in and shows the spaces you belong to.
+  const PUBLIC_SLUG = (location.pathname.match(/^\/s\/([a-z0-9-]+)/) || [])[1] || null;
+  const TOKEN_KEY = 'jejak-token', SPACE_KEY = 'jejak-space';
+  let token = localStorage.getItem(TOKEN_KEY);
+  let currentSpace = localStorage.getItem(SPACE_KEY) || '';
+  const loginBox = document.getElementById('login');
+  const accountBox = document.getElementById('account');
+
+  function esc(t) {
+    return String(t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function dataUrl() {
+    if (PUBLIC_SLUG) return '/v1/public/' + PUBLIC_SLUG + '/graph';
+    return '/v1/graph' + (currentSpace ? '?space=' + encodeURIComponent(currentSpace) : '');
+  }
+
+  function api(path, opts = {}) {
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    if (token && !PUBLIC_SLUG) headers.Authorization = 'Bearer ' + token;
+    return fetch(path, Object.assign({ cache: 'no-store' }, opts, { headers }));
+  }
+
+  function showLogin(message) {
+    loginBox.hidden = false;
+    document.getElementById('login-err').textContent = message || '';
+    document.getElementById('login-user').focus();
+  }
+
+  document.getElementById('login-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const body = { username: document.getElementById('login-user').value.trim(),
+                   password: document.getElementById('login-pass').value,
+                   token_name: 'browser', days: 30 };
+    fetch('/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(r => r.json().then(j => ({ ok: r.ok, j })))
+      .then(({ ok, j }) => {
+        if (!ok) { showLogin(j.error || 'Sign-in failed'); return; }
+        token = j.token;
+        localStorage.setItem(TOKEN_KEY, token);
+        document.getElementById('login-pass').value = '';
+        loginBox.hidden = true;
+        start();
+      })
+      .catch(() => showLogin('Cannot reach the server.'));
+  });
+
+  function renderAccount(me) {
+    const opts = ['<option value="">All my spaces</option>'].concat(me.spaces.map(sp =>
+      `<option value="${esc(sp.slug)}"${sp.slug === currentSpace ? ' selected' : ''}>${esc(sp.slug)} (${esc(sp.role)})</option>`));
+    accountBox.innerHTML = `<span class="who">${esc(me.username)}</span>
+      <select id="space-select" aria-label="Space">${opts.join('')}</select>
+      <button id="logout-btn" type="button">Sign out</button>`;
+    accountBox.hidden = false;
+    document.getElementById('space-select').addEventListener('change', e => {
+      currentSpace = e.target.value;
+      localStorage.setItem(SPACE_KEY, currentSpace);
+      lastSignature = null;
+      fetchGraph(true);
+    });
+    document.getElementById('logout-btn').addEventListener('click', () => {
+      api('/v1/auth/logout', { method: 'POST' }).finally(() => {
+        localStorage.removeItem(TOKEN_KEY);
+        token = null;
+        location.reload();
+      });
+    });
+  }
+
   function fetchGraph(isFirstLoad) {
-    return fetch('/data.json', { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    return api(dataUrl())
+      .then(r => {
+        if (r.status === 401 && !PUBLIC_SLUG) {
+          localStorage.removeItem(TOKEN_KEY);
+          token = null;
+          showLogin('Please sign in.');
+          throw new Error('signed out');
+        }
+        if (r.status === 404 && PUBLIC_SLUG) throw new Error('this space has no public view');
+        return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status));
+      })
       .then(data => {
         if (!data || !Array.isArray(data.nodes)) throw new Error('bad payload');
         const sig = signature(data);
@@ -1538,17 +1647,33 @@
         applyGraph(data, isFirstLoad);
       })
       .catch(err => {
-        if (isFirstLoad) showMessage('Could not load graph data — is the server running? (' + err.message + ')');
+        if (isFirstLoad && err.message !== 'signed out') showMessage('Could not load graph data (' + err.message + ')');
       });
+  }
+
+  let started = false;
+  function start() {
+    if (started) return;
+    if (!PUBLIC_SLUG) {
+      if (!token) { showLogin(); return; }
+      api('/v1/me').then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(me => {
+          if (currentSpace && !me.spaces.some(sp => sp.slug === currentSpace)) currentSpace = '';
+          renderAccount(me);
+        })
+        .catch(status => { if (status === 401) { localStorage.removeItem(TOKEN_KEY); token = null; showLogin('Please sign in.'); } });
+    }
+    started = true;
+    fetchGraph(true).finally(() => {
+      loop();
+      setInterval(() => { if (token || PUBLIC_SLUG) fetchGraph(false); }, REFRESH_MS);
+    });
   }
 
   // ===== INIT =====
   window.addEventListener('resize', resize);
   resize();
 
-  fetchGraph(true).finally(() => {
-    loop();
-    setInterval(() => fetchGraph(false), REFRESH_MS);
-  });
+  start();
 })();
 </script>

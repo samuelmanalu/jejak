@@ -35,11 +35,6 @@
             "type": "command",
             "command": "python3 ~/.claude/hooks/jejak.py",
             "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/jejak-autosync.py",
-            "timeout": 10
           }
         ]
       }

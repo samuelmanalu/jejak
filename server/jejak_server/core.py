@@ -677,19 +677,26 @@ def cmd_export(session, ctx, all=False, **_):
 def cmd_ask(session, ctx, question, **_):
     question = " ".join(question) if isinstance(question, list) else question
     keywords = [w.lower() for w in question.split() if len(w) > 3]
+    # Pick the 8 answers first, then only their 3 best related entries: hub
+    # memories have thousands of links, and collecting them all is what made
+    # `ask` take seconds on a large graph.
     items = [dict(r) for r in session.run(f"""
         MATCH (m:Memory)
         WHERE {in_scope()} AND m.type <> 'prompt' AND m.type <> 'session_summary'
           AND coalesce(m.superseded, false) = false
           AND any(kw IN $keywords WHERE toLower(m.content) CONTAINS kw)
+        WITH m ORDER BY m.relevance_score DESC LIMIT 8
+        CALL (m) {{
+            OPTIONAL MATCH (m)-[:RELATES_TO]-(related:Memory)
+            WHERE related.type <> 'prompt' AND {in_scope('related')}
+              AND coalesce(related.superseded, false) = false
+            WITH related ORDER BY related.relevance_score DESC LIMIT 3
+            RETURN collect({{type: related.type, content: left(related.content, 100)}}) AS related_items
+        }}
         OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
         OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-        OPTIONAL MATCH (m)-[:RELATES_TO]-(related:Memory)
-        WHERE related.type <> 'prompt' AND {in_scope('related')}
-        WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects,
-             collect(DISTINCT {{type: related.type, content: left(related.content, 100)}}) AS related_items
+        WITH m, related_items, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects
         ORDER BY m.relevance_score DESC
-        LIMIT 8
         RETURN m.memory_id AS id, m.type AS type, m.content AS content,
                m.relevance_score AS score, m.source_file AS source_file,
                topics, projects, related_items
@@ -1020,16 +1027,20 @@ GRAPH_NODES = """
            public, NOT shown AS confidential
 """
 
-# Display only: each memory's top-k links. Every link stays in Neo4j.
+# Display only: each memory's top-k links (a per-memory LIMIT keeps memory use
+# small on a 1 GB heap). Every link stays in Neo4j.
 GRAPH_EDGES = """
-    MATCH (a:Memory)-[r:RELATES_TO]-(b:Memory)
-    WHERE a.space_id IN $spaces AND b.space_id IN $spaces
-      AND coalesce(a.superseded, false) = false AND coalesce(b.superseded, false) = false
-    WITH a, b, coalesce(r.strength, 1) AS strength
-    ORDER BY strength DESC, coalesce(b.relevance_score, 0.0) DESC
-    WITH a, collect({target: left(b.memory_id, 8), strength: strength})[..$k] AS top
-    UNWIND top AS t
-    RETURN left(a.memory_id, 8) AS source, t.target AS target, t.strength AS strength
+    MATCH (a:Memory)
+    WHERE a.space_id IN $spaces AND coalesce(a.superseded, false) = false
+    CALL (a) {
+        MATCH (a)-[r:RELATES_TO]-(b:Memory)
+        WHERE b.space_id IN $spaces AND coalesce(b.superseded, false) = false
+        WITH b, coalesce(r.strength, 1) AS strength
+        ORDER BY strength DESC, coalesce(b.relevance_score, 0.0) DESC
+        LIMIT $k
+        RETURN b, strength
+    }
+    RETURN left(a.memory_id, 8) AS source, left(b.memory_id, 8) AS target, strength
 """
 
 

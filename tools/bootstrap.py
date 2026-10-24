@@ -20,6 +20,7 @@ DEST = os.environ.get("CLAUDE_HOME", os.path.expanduser("~/.claude"))
 
 BEGIN = "<!-- JEJAK:BEGIN"
 END = "<!-- JEJAK:END -->"
+RETIRED = ("jejak-autosync.py",)
 
 
 def backup(path):
@@ -64,6 +65,16 @@ def merge_settings():
             for h in group.get("hooks", []):
                 present.add(hook_key(h, event, group.get("matcher")))
 
+    # Hooks from before the Jejak server; the server replaced them.
+    removed = 0
+    for event, groups in existing.items():
+        for group in groups:
+            before = len(group.get("hooks", []))
+            group["hooks"] = [h for h in group.get("hooks", [])
+                              if not any(r in h.get("command", "") for r in RETIRED)]
+            removed += before - len(group["hooks"])
+        existing[event] = [g for g in groups if g.get("hooks")]
+
     added = 0
     for event, groups in want.items():
         existing.setdefault(event, [])
@@ -86,7 +97,7 @@ def merge_settings():
                 present.add(hook_key(h, event, matcher))
                 added += 1
 
-    if added == 0:
+    if added == 0 and removed == 0:
         print("    settings.json: all Jejak hooks already registered, unchanged")
         return True
 
@@ -95,7 +106,7 @@ def merge_settings():
     with open(target, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
-    print(f"    settings.json: registered {added} Jejak hook(s)"
+    print(f"    settings.json: registered {added} Jejak hook(s), removed {removed} retired"
           + (f" (backup: {os.path.basename(bak)})" if bak else ""))
     return True
 

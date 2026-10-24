@@ -9,10 +9,11 @@ most callers are AI agents that act on what they are told.
 import contextlib
 import ipaddress
 import os
+import json
 import threading
 
 from fastapi import Body, FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import auth, core
 from .config import driver, settings
@@ -119,6 +120,8 @@ _graph_cache, _graph_lock = {}, threading.Lock()
 
 
 def cached_graph(spaces, public_view):
+    """The graph as encoded JSON bytes. Encoding 5 MB through FastAPI's
+    jsonable_encoder took ~15 s, so the bytes themselves are cached."""
     key = (tuple(sorted(spaces)), public_view)
     with _session() as s:
         sig = core.graph_signature(s, list(spaces))
@@ -126,7 +129,8 @@ def cached_graph(spaces, public_view):
             hit = _graph_cache.get(key)
             if hit and hit[0] == sig:
                 return hit[1]
-        data = core.graph(s, list(spaces), public_view, settings()["edges_per_node"])
+        data = json.dumps(core.graph(s, list(spaces), public_view, settings()["edges_per_node"]),
+                          separators=(",", ":")).encode()
     with _graph_lock:
         if len(_graph_cache) > 64:
             _graph_cache.clear()
@@ -411,8 +415,11 @@ def create_app():
     @app.get("/v1/graph")
     def my_graph(request: Request, space: str = None):
         p = principal(request)
-        spaces = [p.space_by_slug(space)] if space else p.read_spaces
-        return cached_graph(spaces, False)
+        try:
+            spaces = [p.space_by_slug(space)] if space else p.read_spaces
+        except auth.AccessError as e:
+            raise ApiError(404, str(e), "jejak space list")
+        return Response(cached_graph(spaces, False), media_type="application/json")
 
     @app.get("/v1/public/{slug}/graph")
     def public_graph(slug: str):
@@ -420,7 +427,7 @@ def create_app():
             sid = auth.public_space(s, slug)
         if not sid:
             raise ApiError(404, "No public graph here.")
-        return cached_graph([sid], True)
+        return Response(cached_graph([sid], True), media_type="application/json")
 
     @app.get("/")
     @app.get("/s/{slug}")

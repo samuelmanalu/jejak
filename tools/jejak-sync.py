@@ -1099,7 +1099,8 @@ def cmd_daemon(args):
 
     if args.action == "install":
         if not os.path.exists(daemon_script):
-            raise SystemExit(f"  {daemon_script} not found - run ./install.sh first")
+            raise SystemExit("  The git sync daemon is retired: machines logged in to one Jejak "
+                             "server are always in sync. See README 'Jejak server'.")
         remote_config()  # fails loudly if no remote is configured
         interval = max(60, args.interval)
         cfg = {"interval_seconds": interval,
