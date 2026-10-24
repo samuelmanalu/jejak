@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak  # noqa: E402
 
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", os.path.expanduser("~/.claude"))

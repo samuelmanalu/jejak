@@ -17,9 +17,8 @@ import os
 import sys
 import subprocess
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak
-from neo4j import GraphDatabase
 
 HOOKS_DIR = os.path.expanduser("~/.claude/hooks")
 
@@ -32,11 +31,6 @@ SKIP_PATH_MARKERS = [
     "/.claude/hooks/", "/node_modules/", "/.git/", "/dist/", "/build/",
     "/__pycache__/", "/.venv", "/venv/", "/scratchpad/", "/.next/", "/target/",
 ]
-
-
-def get_driver():
-    cfg = jejak.load_config("neo4j")
-    return GraphDatabase.driver(cfg["uri"], auth=(cfg["user"], cfg["password"]))
 
 
 def summarize_document(path, content):
@@ -68,17 +62,9 @@ def summarize_document(path, content):
 
 
 def existing_artifact_id(cwd, source_file):
-    driver = get_driver()
-    try:
-        with driver.session() as s:
-            rec = s.run("""
-                MATCH (m:Memory {type: 'artifact'})-[:IN_PROJECT]->(p:Project {path: $path})
-                WHERE m.source_file = $sf AND coalesce(m.superseded, false) = false
-                RETURN left(m.memory_id, 8) AS id LIMIT 1
-            """, path=cwd, sf=source_file).single()
-            return rec["id"] if rec else None
-    finally:
-        driver.close()
+    import jejak_client as client
+    out, code = client.run("artifact-id", {"source_file": source_file}, client.build_ctx(cwd), timeout=10)
+    return out.strip() if code == 0 and out.strip() else None
 
 
 def save_artifact(content_text, cwd, session_id, source_file):

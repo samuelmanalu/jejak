@@ -18,7 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak  # noqa: E402
 
 DEFAULT_ROOTS = os.environ.get("JEJAK_RECAP_ROOTS", "~/projects:~/dev:~/src:~/code:~/repos:~/IdeaProjects:~/.claude").split(":")

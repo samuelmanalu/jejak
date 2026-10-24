@@ -47,6 +47,7 @@ import tempfile
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak  # noqa: E402
 from neo4j import GraphDatabase  # noqa: E402
 

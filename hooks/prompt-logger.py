@@ -5,7 +5,7 @@ import os
 import re
 import mysql.connector
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak
 
 TAGS = {

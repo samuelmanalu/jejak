@@ -1,991 +1,383 @@
 #!/usr/bin/env python3
 """
-Jejak CLI — save, query, and map knowledge across sessions.
+Jejak CLI — a client of a Jejak server.
 
-Usage:
-  jejak save <type> <content>         Save a knowledge entry
-  jejak map [directory]               Show knowledge map for a directory
-  jejak session <session_id>          Show all knowledge from a session
-  jejak search <query>                Search across all knowledge
-  jejak topics [directory]            Show topic clusters for a directory
-  jejak links <memory_id>             Show all connections for a memory
-  jejak get <memory_id> [--json]      Show one memory in full (any status)
-  jejak delete <memory_id> [-r why]   Soft-delete a memory (reversible)
-  jejak restore <memory_id>           Bring a deleted memory back as a new entry
-  jejak stats                         Show global stats
+Knowledge:
+  jejak save <type> <content> [-d DIR] [-f FILE] [--supersedes ID] [--visibility public] [--space S]
+  jejak check-duplicates <content> [-d DIR]
+  jejak ask <question> [-d DIR]        jejak search <query>
+  jejak map [DIR]   jejak topics [DIR]   jejak rank [DIR] [-a]   jejak export [DIR] [-a]
+  jejak links <id>  jejak get <id> [--json]   jejak session <id> [--json]   jejak stats
+  jejak delete <id> -r <why>   jejak restore <id>   jejak visibility <public|confidential> <id>...
+
+Connection and access:
+  jejak login <url> [--invite | --token-stdin]    jejak logout    jejak whoami    jejak status
+  jejak space list | create <slug> | use <slug> [DIR] | members <slug>
+              | add-member <slug> <user> <viewer|editor|owner> | remove-member <slug> <user>
+              | public <slug> on|off
+  jejak token list | create <name> [--days N] [--file F] | revoke <id>
+  jejak user list | create <name> [--space S --role R] [--admin] | invite <name> | disable|enable <name>
+  jejak password
 
 Types: decision, learning, finding, issue, solution, architecture, convention, context
+Every error ends with a `hint:` line naming the command that fixes it.
 """
-import json
-import sys
-import os
-import uuid
 import argparse
-from neo4j import GraphDatabase
-
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
-import jejak_common as jejak
-
-detect_topics = jejak.detect_topics
-extract_project_name = jejak.extract_project_name
-update_relevance_score = jejak.update_relevance_score
-
-VALID_TYPES = ["decision", "learning", "finding", "issue", "solution", "architecture", "convention", "context", "artifact"]
-
-def get_driver():
-    config = jejak.load_config("neo4j")
-    return GraphDatabase.driver(config["uri"], auth=(config["user"], config["password"]))
-
-def cmd_save(args):
-    memory_type = args.type
-    content = jejak.redact(" ".join(args.content))
-    cwd = args.directory or os.getcwd()
-    session_id = os.environ.get("CLAUDE_SESSION_ID", args.session or "manual")
-    source_file = args.file or None
-    supersedes = getattr(args, "supersedes", None)
-    visibility = getattr(args, "visibility", None)
-
-    if memory_type not in VALID_TYPES:
-        print(f"Invalid type '{memory_type}'. Valid types: {', '.join(VALID_TYPES)}")
-        sys.exit(1)
-
-    topics = detect_topics(content)
-    project_name = extract_project_name(cwd)
-    machine_name = jejak.machine_name()
-
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            # Global exact-content dedup (reuse a node that exists in any project).
-            # Active nodes only: bumping a superseded/deleted twin would leave the
-            # re-saved knowledge invisible (and `restore` relies on re-saving).
-            dup_record = session.run("""
-                MATCH (m:Memory) WHERE m.content = $content
-                  AND coalesce(m.superseded, false) = false
-                RETURN m.memory_id AS memory_id LIMIT 1
-            """, content=content).single()
-
-            if dup_record:
-                existing_id = dup_record["memory_id"]
-                session.run("""
-                    MATCH (m:Memory {memory_id: $memory_id})
-                    SET m.updated_at = datetime(), m.hit_count = coalesce(m.hit_count, 1) + 1,
-                        m.last_accessed_at = datetime()
-                """, memory_id=existing_id)
-                session.run("""
-                    MERGE (p:Project {path: $path}) SET p.name = $name, p.last_seen = datetime()
-                    WITH p
-                    MATCH (m:Memory {memory_id: $memory_id})
-                    MERGE (m)-[:IN_PROJECT]->(p)
-                """, path=cwd, name=project_name, memory_id=existing_id)
-                session.run("""
-                    MERGE (s:Session {session_id: $session_id})
-                    SET s.last_active = datetime(), s.machine_name = $machine_name
-                    WITH s
-                    MATCH (m:Memory {memory_id: $memory_id})
-                    MERGE (m)-[:IN_SESSION]->(s)
-                    WITH s
-                    MATCH (p:Project {path: $path})
-                    MERGE (s)-[:IN_PROJECT]->(p)
-                """, session_id=session_id, machine_name=machine_name, memory_id=existing_id, path=cwd)
-                update_relevance_score(session, existing_id)
-                score_result = session.run(
-                    "MATCH (m:Memory {memory_id: $mid}) RETURN m.relevance_score AS score", mid=existing_id
-                ).single()
-                score = score_result["score"] if score_result else 0
-                if visibility:
-                    _set_visibility(session, existing_id, visibility)
-                pruned = jejak.mark_superseded(session, supersedes, existing_id) if supersedes else None
-                msg = f"Existing [{memory_type}] id:{existing_id[:8]} score:{score:.0f} project:{project_name}"
-                if pruned:
-                    msg += f" SUPERSEDES:{pruned['id'][:8]}"
-                print(msg)
-                return
-
-            memory_id = str(uuid.uuid4())
-            session.run("""
-                CREATE (m:Memory {memory_id: $memory_id, type: $type, content: $content,
-                    machine_name: $machine_name, hit_count: 1, relevance_score: 0.0,
-                    source_file: $source_file, visibility: $visibility, last_accessed_at: datetime(),
-                    created_at: datetime(), updated_at: datetime()})
-            """, memory_id=memory_id, type=memory_type, content=content,
-                machine_name=machine_name, source_file=source_file,
-                visibility=visibility or "confidential")
-
-            session.run("""
-                MERGE (p:Project {path: $path}) SET p.name = $name, p.last_seen = datetime()
-                WITH p
-                MATCH (m:Memory {memory_id: $memory_id})
-                MERGE (m)-[:IN_PROJECT]->(p)
-            """, path=cwd, name=project_name, memory_id=memory_id)
-
-            session.run("""
-                MERGE (s:Session {session_id: $session_id})
-                SET s.last_active = datetime(), s.machine_name = $machine_name
-                WITH s
-                MATCH (m:Memory {memory_id: $memory_id})
-                MERGE (m)-[:IN_SESSION]->(s)
-                WITH s
-                MATCH (p:Project {path: $path})
-                MERGE (s)-[:IN_PROJECT]->(p)
-            """, session_id=session_id, machine_name=machine_name, memory_id=memory_id, path=cwd)
-
-            for topic in topics:
-                if topic == jejak.CATCHALL_TOPIC:  # skip hot catch-all node
-                    continue
-                session.run("""
-                    MERGE (t:Topic {name: $topic})
-                    WITH t
-                    MATCH (m:Memory {memory_id: $memory_id})
-                    MERGE (m)-[:ABOUT]->(t)
-                """, topic=topic, memory_id=memory_id)
-
-            # Link only to non-prompt memories on REAL (non-general) topics
-            session.run("""
-                MATCH (m:Memory {memory_id: $memory_id})-[:ABOUT]->(t:Topic)<-[:ABOUT]-(other:Memory)
-                WHERE other.memory_id <> $memory_id
-                  AND other.type <> 'prompt'
-                  AND t.name <> $catchall
-                  AND NOT exists((m)-[:RELATES_TO]-(other))
-                WITH m, other, count(t) AS shared_topics
-                WHERE shared_topics >= 1
-                MERGE (m)-[:RELATES_TO {strength: shared_topics}]->(other)
-            """, memory_id=memory_id, catchall=jejak.CATCHALL_TOPIC)
-
-            update_relevance_score(session, memory_id)
-            score_result = session.run(
-                "MATCH (m:Memory {memory_id: $mid}) RETURN m.relevance_score AS score", mid=memory_id
-            ).single()
-            score = score_result["score"] if score_result else 0
-            pruned = jejak.mark_superseded(session, supersedes, memory_id) if supersedes else None
-
-        msg = (f"Saved [{memory_type}] id:{memory_id[:8]} score:{score:.0f} topics:{topics} "
-               f"project:{project_name} visibility:{visibility or 'confidential'}")
-        if pruned:
-            msg += f" SUPERSEDES:{pruned['id'][:8]}"
-        print(msg)
-    finally:
-        driver.close()
-
-def cmd_map(args):
-    cwd = args.directory or os.getcwd()
-    project_name = extract_project_name(cwd)
-    driver = get_driver()
-
-    try:
-        with driver.session() as session:
-            stats = session.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                OPTIONAL MATCH (s:Session)-[:IN_PROJECT]->(p)
-                RETURN count(DISTINCT m) AS memories, count(DISTINCT t) AS topics,
-                       count(DISTINCT s) AS sessions
-            """, path=cwd).single()
-
-            if stats["memories"] == 0:
-                print(f"No knowledge found for {project_name} ({cwd})")
-                return
-
-            print(f"=== Knowledge Map: {project_name} ===")
-            print(f"    Path: {cwd}")
-            print(f"    Memories: {stats['memories']} | Topics: {stats['topics']} | Sessions: {stats['sessions']}")
-            print()
-
-            type_groups = session.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                WHERE coalesce(m.superseded, false) = false
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                WITH m, collect(t.name) AS topics
-                ORDER BY m.created_at DESC
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.created_at AS created_at, topics
-            """, path=cwd)
-
-            by_type = {}
-            for r in type_groups:
-                t = r["type"]
-                if t not in by_type:
-                    by_type[t] = []
-                by_type[t].append(dict(r))
-
-            type_order = ["decision", "architecture", "convention", "learning", "solution", "finding", "issue", "context", "artifact", "prompt"]
-            for t in type_order:
-                if t not in by_type:
-                    continue
-                entries = by_type[t]
-                print(f"  [{t.upper()}] ({len(entries)})")
-                for e in entries[:10]:
-                    preview = e["content"][:120].replace("\n", " ")
-                    topic_str = ", ".join(e["topics"][:3]) if e["topics"] else ""
-                    ts = str(e["created_at"])[:16] if e["created_at"] else ""
-                    print(f"    {e['id'][:8]}  {ts}  [{topic_str}]")
-                    print(f"             {preview}")
-                if len(entries) > 10:
-                    print(f"    ... and {len(entries) - 10} more")
-                print()
-
-            links = session.run("""
-                MATCH (m1:Memory)-[r:RELATES_TO]->(m2:Memory)
-                WHERE EXISTS {
-                    MATCH (m1)-[:IN_PROJECT]->(p:Project {path: $path})
-                }
-                RETURN m1.memory_id AS from_id, left(m1.content, 50) AS from_text,
-                       r.strength AS strength,
-                       m2.memory_id AS to_id, left(m2.content, 50) AS to_text
-                ORDER BY r.strength DESC
-                LIMIT 15
-            """, path=cwd)
-            link_list = [dict(r) for r in links]
-
-            if link_list:
-                print("  [CONNECTIONS]")
-                for l in link_list:
-                    print(f"    {l['from_id'][:8]} --({l['strength']})--> {l['to_id'][:8]}")
-                    print(f"      \"{l['from_text']}...\"")
-                    print(f"      \"{l['to_text']}...\"")
-                print()
-
-    finally:
-        driver.close()
-
-def cmd_session(args):
-    session_id = args.session_id
-    driver = get_driver()
-
-    try:
-        with driver.session() as session:
-            memories = session.run("""
-                MATCH (m:Memory)-[:IN_SESSION]->(s:Session {session_id: $session_id})
-                WHERE coalesce(m.superseded, false) = false
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-                WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects
-                ORDER BY m.created_at ASC
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.created_at AS created_at, m.source_file AS source_file,
-                       m.relevance_score AS score, topics, projects
-            """, session_id=session_id)
-
-            results = [dict(r) for r in memories]
-
-            if getattr(args, "json", False):
-                import json as _json
-                for r in results:
-                    r["created_at"] = str(r["created_at"]) if r["created_at"] else None
-                print(_json.dumps(results))
-                return
-
-            if not results:
-                print(f"No memories found for session {session_id}")
-                return
-
-            print(f"=== Session: {session_id} ===")
-            print(f"    Memories: {len(results)}")
-            print()
-            for m in results:
-                preview = m["content"][:150].replace("\n", " ")
-                ts = str(m["created_at"])[:16] if m["created_at"] else ""
-                topics = ", ".join(m["topics"][:4]) if m["topics"] else ""
-                projects = ", ".join(m["projects"]) if m["projects"] else ""
-                print(f"  {m['id'][:8]}  [{m['type']}]  {ts}")
-                print(f"    Topics: {topics}  Project: {projects}")
-                print(f"    {preview}")
-                print()
-    finally:
-        driver.close()
-
-def cmd_search(args):
-    search_term = " ".join(args.query)
-    driver = get_driver()
-
-    try:
-        with driver.session() as session:
-            results = session.run("""
-                MATCH (m:Memory)
-                WHERE toLower(m.content) CONTAINS toLower($search_term)
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-                WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects
-                ORDER BY m.created_at DESC
-                LIMIT 20
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.created_at AS created_at, topics, projects,
-                       coalesce(m.superseded, false) AS superseded, m.superseded_by AS superseded_by
-            """, search_term=search_term)
-
-            result_list = [dict(r) for r in results]
-            if not result_list:
-                print(f"No results for '{search_term}'")
-                return
-
-            print(f"=== Search: '{search_term}' ({len(result_list)} results) ===")
-            print()
-            for m in result_list:
-                preview = m["content"][:150].replace("\n", " ")
-                ts = str(m["created_at"])[:16] if m["created_at"] else ""
-                topics = ", ".join(m["topics"][:3]) if m["topics"] else ""
-                projects = ", ".join(m["projects"]) if m["projects"] else ""
-                status = ""
-                if m["superseded"]:
-                    status = ("  (DELETED)" if m["superseded_by"] == "deleted"
-                              else f"  (SUPERSEDED by {(m['superseded_by'] or '?')[:8]})")
-                print(f"  {m['id'][:8]}  [{m['type']}]  {ts}  project:{projects}{status}")
-                print(f"    [{topics}] {preview}")
-                print()
-    finally:
-        driver.close()
-
-def cmd_topics(args):
-    cwd = args.directory or os.getcwd()
-    project_name = extract_project_name(cwd)
-    driver = get_driver()
-
-    try:
-        with driver.session() as session:
-            results = session.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                MATCH (m)-[:ABOUT]->(t:Topic)
-                WITH t.name AS topic, count(m) AS count, collect(m.type) AS types
-                ORDER BY count DESC
-                RETURN topic, count, types
-            """, path=cwd)
-
-            result_list = [dict(r) for r in results]
-            if not result_list:
-                print(f"No topics found for {project_name}")
-                return
-
-            print(f"=== Topics: {project_name} ===")
-            print()
-            for r in result_list:
-                type_summary = {}
-                for t in r["types"]:
-                    type_summary[t] = type_summary.get(t, 0) + 1
-                type_str = ", ".join(f"{k}:{v}" for k, v in sorted(type_summary.items(), key=lambda x: -x[1]))
-                bar = "#" * min(r["count"], 30)
-                print(f"  {r['topic']:15s}  {r['count']:3d}  {bar}  ({type_str})")
-    finally:
-        driver.close()
-
-def cmd_links(args):
-    memory_id_prefix = args.memory_id
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            match = session.run("""
-                MATCH (m:Memory)
-                WHERE m.memory_id STARTS WITH $prefix
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.relevance_score AS score, m.hit_count AS hits
-            """, prefix=memory_id_prefix)
-            record = match.single()
-            if not record:
-                print(f"No memory found matching '{memory_id_prefix}'")
-                return
-
-            mem = dict(record)
-            full_id = mem["id"]
-            print(f"=== Links for {full_id[:8]} ===")
-            print(f"    Type: {mem['type']}  Score: {mem['score'] or 0:.0f}  Hits: {mem['hits'] or 0}")
-            print(f"    {mem['content'][:150]}")
-            print()
-
-            topics = session.run("""
-                MATCH (m:Memory {memory_id: $id})-[:ABOUT]->(t:Topic)
-                RETURN collect(t.name) AS topics
-            """, id=full_id).single()
-            print(f"  Topics: {', '.join(topics['topics']) if topics['topics'] else 'none'}")
-
-            projects = session.run("""
-                MATCH (m:Memory {memory_id: $id})-[:IN_PROJECT]->(p:Project)
-                RETURN collect(p.name) AS names, collect(p.path) AS paths
-            """, id=full_id).single()
-            if projects["names"]:
-                for name, path in zip(projects["names"], projects["paths"]):
-                    print(f"  Project: {name} ({path})")
-
-            sessions = session.run("""
-                MATCH (m:Memory {memory_id: $id})-[:IN_SESSION]->(s:Session)
-                RETURN collect(s.session_id) AS sids
-            """, id=full_id).single()
-            if sessions["sids"]:
-                print(f"  Sessions: {', '.join(s[:8] for s in sessions['sids'])}")
-
-            print()
-            relates = session.run("""
-                MATCH (m:Memory {memory_id: $id})-[r:RELATES_TO]-(other:Memory)
-                WHERE other.type <> 'prompt'
-                RETURN other.memory_id AS id, other.type AS type, other.content AS content,
-                       other.relevance_score AS score, r.strength AS strength
-                ORDER BY r.strength DESC, other.relevance_score DESC
-            """, id=full_id)
-            links = [dict(r) for r in relates]
-            if links:
-                print(f"  Connections ({len(links)}):")
-                for l in links:
-                    preview = l["content"][:80].replace("\n", " ")
-                    score = l["score"] or 0
-                    print(f"    --({l['strength']})--> {l['id'][:8]} [{l['type']}] score:{score:.0f}")
-                    print(f"           {preview}")
-            else:
-                print("  No connections")
-    finally:
-        driver.close()
-
-def cmd_check_duplicates(args):
-    content = " ".join(args.content)
-    cwd = args.directory or os.getcwd()
-    driver = get_driver()
-
-    try:
-        with driver.session() as session:
-            results = session.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                WHERE m.type <> 'prompt' AND coalesce(m.superseded, false) = false
-                WITH m ORDER BY m.created_at DESC LIMIT 30
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       collect(t.name) AS topics
-            """, path=cwd)
-
-            existing = [dict(r) for r in results]
-            if not existing:
-                print("NO_EXISTING_KNOWLEDGE")
-                return
-
-            print(f"=== Existing knowledge in project ({len(existing)} entries) ===")
-            print(f"New content to check: {content}")
-            print()
-            for e in existing:
-                topics = ", ".join(e["topics"][:3]) if e["topics"] else ""
-                print(f"  [{e['type']}][{topics}] {e['content']}")
-            print()
-            print("INSTRUCTIONS: Compare the new content against each existing entry above.")
-            print("1. If any existing entry captures the SAME intent/meaning (even with different wording): DUPLICATE")
-            print("2. If the new content CONTRADICTS an existing entry (e.g. different values for the same setting,")
-            print("   opposite decisions about the same topic): CONFLICT:<memory_id> and explain the contradiction.")
-            print("   Ask the user which version is current before saving.")
-            print("3. If the new content is genuinely new knowledge: UNIQUE")
-    finally:
-        driver.close()
-
-def cmd_rank(args):
-    cwd = args.directory or os.getcwd()
-    show_all = args.all
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            jejak.recalculate_all_scores(session)  # canonical formula, with decay
-
-            if show_all:
-                query = """
-                    MATCH (m:Memory) WHERE m.type <> 'prompt' AND coalesce(m.superseded, false) = false
-                    OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                    OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-                    OPTIONAL MATCH (m)-[:IN_SESSION]->(s:Session)
-                    OPTIONAL MATCH (m)-[:RELATES_TO]-(other:Memory)
-                    WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.name) AS projects,
-                         count(DISTINCT s) AS sessions, count(DISTINCT other) AS connections
-                    ORDER BY m.relevance_score DESC
-                    RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                           m.relevance_score AS score, m.hit_count AS hits,
-                           sessions, connections, topics, projects
-                """
-                results = session.run(query)
-            else:
-                query = """
-                    MATCH (m:Memory)-[:IN_PROJECT]->(proj:Project {path: $path})
-                    WHERE m.type <> 'prompt' AND coalesce(m.superseded, false) = false
-                    OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                    OPTIONAL MATCH (m)-[:IN_SESSION]->(s:Session)
-                    OPTIONAL MATCH (m)-[:RELATES_TO]-(other:Memory)
-                    WITH m, collect(DISTINCT t.name) AS topics,
-                         count(DISTINCT s) AS sessions, count(DISTINCT other) AS connections
-                    ORDER BY m.relevance_score DESC
-                    RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                           m.relevance_score AS score, m.hit_count AS hits,
-                           sessions, connections, topics
-                """
-                results = session.run(query, path=cwd)
-
-            items = [dict(r) for r in results]
-
-            if not items:
-                scope = "all projects" if show_all else extract_project_name(cwd)
-                print(f"No scored knowledge found for {scope}")
-                return
-
-            max_score = max((i["score"] or 0) for i in items) if items else 1
-            if max_score == 0:
-                max_score = 1
-
-            scope_label = "ALL PROJECTS" if show_all else extract_project_name(cwd)
-            print(f"=== Knowledge Ranking: {scope_label} ({len(items)} entries) ===")
-            print(f"    Score formula: (hits*3 + sessions*5 + projects*10 + connections*2) * type_weight")
-            print()
-
-            for i, item in enumerate(items):
-                score = item["score"] or 0
-                normalized = int((score / max_score) * 100) if max_score > 0 else 0
-                bar_len = int(normalized / 5)
-                bar = "#" * bar_len
-                preview = item["content"][:90].replace("\n", " ")
-                topic_str = ", ".join(item["topics"][:3]) if item["topics"] else ""
-                hits = item["hits"] or 0
-                sessions = item["sessions"] or 0
-                connections = item["connections"] or 0
-
-                depth_label = ""
-                if i < 5:
-                    depth_label = " [L1:global]"
-                elif i < 15:
-                    depth_label = " [L2:project]"
-                else:
-                    depth_label = " [L3:deep]"
-
-                print(f"  {i+1:3d}. {item['id'][:8]}  score:{score:6.1f}  norm:{normalized:3d}%  {bar}{depth_label}")
-                print(f"       [{item['type']}][{topic_str}] hits:{hits} sess:{sessions} conn:{connections}")
-                print(f"       {preview}")
-                if i < len(items) - 1:
-                    print()
-
-            print()
-            print("  Loading depth:")
-            print("    L1 (global)  = top 5 by score — loaded in EVERY session")
-            print("    L2 (project) = next 10 from current project — loaded on SessionStart")
-            print("    L3 (deep)    = remaining — available via /jejak search")
-            print("    L4 (code)    = not in graph — fall back to codebase search")
-    finally:
-        driver.close()
-
-def cmd_export(args):
-    cwd = args.directory or os.getcwd()
-    show_all = args.all
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            if show_all:
-                projects = session.run("""
-                    MATCH (p:Project)
-                    RETURN p.name AS name, p.path AS path
-                    ORDER BY p.name
-                """)
-            else:
-                projects = session.run("""
-                    MATCH (p:Project {path: $path})
-                    RETURN p.name AS name, p.path AS path
-                """, path=cwd)
-
-            project_list = [dict(r) for r in projects]
-            if not project_list:
-                print(f"No projects found")
-                return
-
-            output = []
-            output.append("# Jejak Export")
-            output.append(f"# Generated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            output.append("")
-
-            for proj in project_list:
-                memories = session.run("""
-                    MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                    WHERE m.type <> 'prompt' AND m.type <> 'session_summary'
-                      AND coalesce(m.superseded, false) = false
-                    OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                    WITH m, collect(DISTINCT t.name) AS topics
-                    ORDER BY m.relevance_score DESC
-                    RETURN m.type AS type, m.content AS content,
-                           m.relevance_score AS score, m.hit_count AS hits,
-                           m.source_file AS source_file, topics
-                """, path=proj["path"])
-                items = [dict(r) for r in memories]
-                if not items:
-                    continue
-
-                output.append(f"## {proj['name']}")
-                output.append(f"Path: `{proj['path']}`")
-                output.append("")
-
-                by_type = {}
-                for item in items:
-                    t = item["type"]
-                    if t not in by_type:
-                        by_type[t] = []
-                    by_type[t].append(item)
-
-                type_order = ["architecture", "decision", "convention", "learning", "solution", "finding", "issue", "context", "artifact"]
-                for t in type_order:
-                    if t not in by_type:
-                        continue
-                    output.append(f"### {t.title()}s")
-                    for item in by_type[t]:
-                        score = item["score"] or 0
-                        topic_str = ", ".join(item["topics"][:4]) if item["topics"] else ""
-                        output.append(f"- **[score:{score:.0f}]** {item['content']}")
-                        if topic_str:
-                            output.append(f"  Topics: {topic_str}")
-                        if item.get("source_file"):
-                            output.append(f"  File: `{item['source_file']}`")
-                    output.append("")
-
-            print("\n".join(output))
-    finally:
-        driver.close()
-
-def cmd_ask(args):
-    question = " ".join(args.question)
-    cwd = args.directory or os.getcwd()
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            keywords = [w.lower() for w in question.split() if len(w) > 3]
-
-            results = session.run("""
-                MATCH (m:Memory)
-                WHERE m.type <> 'prompt' AND m.type <> 'session_summary'
-                  AND coalesce(m.superseded, false) = false
-                  AND any(kw IN $keywords WHERE toLower(m.content) CONTAINS kw)
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-                OPTIONAL MATCH (m)-[:RELATES_TO]-(related:Memory)
-                WHERE related.type <> 'prompt'
-                WITH m, collect(DISTINCT t.name) AS topics,
-                     collect(DISTINCT p.name) AS projects,
-                     collect(DISTINCT {type: related.type, content: left(related.content, 100)}) AS related_items
-                ORDER BY m.relevance_score DESC
-                LIMIT 8
-                RETURN m.memory_id AS id, m.type AS type, m.content AS content,
-                       m.relevance_score AS score, m.source_file AS source_file,
-                       topics, projects, related_items
-            """, keywords=keywords)
-
-            items = [dict(r) for r in results]
-            if not items:
-                print(f"No knowledge found for: {question}")
-                print("Try /jejak search with different terms, or explore the codebase directly.")
-                return
-
-            print(f"=== Answer from Jejak ===")
-            print(f"Question: {question}")
-            print()
-
-            for i, item in enumerate(items):
-                score = item["score"] or 0
-                topic_str = ", ".join(item["topics"][:3]) if item["topics"] else ""
-                proj_str = ", ".join(item["projects"][:2]) if item["projects"] else ""
-                print(f"  {i+1}. [{item['type']}] score:{score:.0f} project:{proj_str}")
-                print(f"     {item['content']}")
-                if item.get("source_file"):
-                    print(f"     File: {item['source_file']}")
-                if topic_str:
-                    print(f"     Topics: {topic_str}")
-
-                related = [r for r in (item.get("related_items") or []) if r.get("content")]
-                if related:
-                    print(f"     Related:")
-                    for r in related[:3]:
-                        print(f"       - [{r['type']}] {r['content']}")
-                print()
-
-            print("INSTRUCTIONS: Use the knowledge above to answer the user's question.")
-            print("If the answer is incomplete, suggest checking /jejak search or exploring the codebase.")
-    finally:
-        driver.close()
-
-def cmd_stats(args):
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            result = session.run("""
-                OPTIONAL MATCH (m:Memory) WITH count(m) AS memories
-                OPTIONAL MATCH (p:Project) WITH memories, count(p) AS projects
-                OPTIONAL MATCH (s:Session) WITH memories, projects, count(s) AS sessions
-                OPTIONAL MATCH (t:Topic) WITH memories, projects, sessions, count(t) AS topics
-                RETURN memories, projects, sessions, topics
-            """).single()
-
-            print("=== Jejak Stats ===")
-            print(f"  Memories:  {result['memories']}")
-            print(f"  Projects:  {result['projects']}")
-            print(f"  Sessions:  {result['sessions']}")
-            print(f"  Topics:    {result['topics']}")
-            vis = session.run(f"""
-                MATCH (m:Memory) WHERE {jejak.NOT_SUPERSEDED}
-                RETURN sum(CASE WHEN {jejak.IS_PUBLIC} THEN 1 ELSE 0 END) AS public, count(m) AS active
-            """).single()
-            print(f"  Public:    {vis['public'] or 0} of {vis['active']} active (the rest are confidential)")
-            print()
-
-            projects = session.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project)
-                WITH p, count(m) AS mem_count
-                ORDER BY mem_count DESC
-                RETURN p.name AS name, p.path AS path, mem_count
-            """)
-            print("  Projects:")
-            for p in projects:
-                print(f"    {p['name'] or '?':25s}  {p['mem_count']:4d} memories  ({p['path']})")
-
-            print()
-            machines = session.run("""
-                MATCH (m:Memory)
-                WITH m.machine_name AS machine, count(m) AS count
-                ORDER BY count DESC
-                RETURN machine, count
-            """)
-            print("  Machines:")
-            for m in machines:
-                print(f"    {m['machine'] or '?':25s}  {m['count']:4d} memories")
-    finally:
-        driver.close()
-
-def _resolve_memory(session, prefix):
-    """Exactly one memory_id for an id or id prefix, or exit with the reason."""
-    if not prefix or len(prefix) < 4:
-        print("Give at least 4 characters of the memory id.")
-        sys.exit(1)
-    ids = [r["id"] for r in session.run(
-        "MATCH (m:Memory) WHERE m.memory_id STARTS WITH $prefix "
-        "RETURN m.memory_id AS id LIMIT 6", prefix=prefix)]
-    if not ids:
-        print(f"No memory found matching '{prefix}'")
-        sys.exit(1)
-    if len(ids) > 1:
-        print(f"'{prefix}' is ambiguous: {', '.join(i[:12] for i in ids)} — use more characters.")
-        sys.exit(1)
-    return ids[0]
-
-def _memory_details(session, memory_id):
-    rec = session.run("""
-        MATCH (m:Memory {memory_id: $id})
-        OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-        OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-        OPTIONAL MATCH (m)-[:IN_SESSION]->(s:Session)
-        OPTIONAL MATCH (older:Memory {superseded_by: m.memory_id})
-        WITH m, collect(DISTINCT t.name) AS topics, collect(DISTINCT p.path) AS project_paths,
-             collect(DISTINCT p.name) AS projects, count(DISTINCT s) AS sessions,
-             collect(DISTINCT older.memory_id) AS supersedes
-        RETURN m {.*} AS m, topics, project_paths, projects, sessions, supersedes
-    """, id=memory_id).single()
-    m = dict(rec["m"])
-    for k, v in list(m.items()):
-        if hasattr(v, "iso_format"):
-            m[k] = v.iso_format()
-    if not m.get("superseded"):
-        status = "active"
-    elif m.get("superseded_by") == "deleted":
-        status = "deleted"
+import getpass
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jejak_client as client  # noqa: E402
+import jejak_common as jejak  # noqa: E402
+
+VALID_TYPES = ["decision", "learning", "finding", "issue", "solution", "architecture", "convention",
+               "context", "artifact"]
+
+
+def fail(message, hint=None, code=1):
+    print(f"error: {message}", file=sys.stderr)
+    if hint:
+        print(f"hint: {hint}", file=sys.stderr)
+    sys.exit(code)
+
+
+def emit(data, as_json):
+    if as_json:
+        print(json.dumps(data, indent=1))
+    elif isinstance(data, str):
+        print(data)
     else:
-        status = "superseded"
-    return {
-        "memory_id": m.get("memory_id"), "type": m.get("type"), "status": status,
-        "content": m.get("content"), "source_file": m.get("source_file"),
-        "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
-        "machine_name": m.get("machine_name"),
-        "visibility": m.get("visibility") or "confidential",
-        "relevance_score": m.get("relevance_score"), "hit_count": m.get("hit_count"),
-        "superseded_at": m.get("superseded_at"), "superseded_by": m.get("superseded_by"),
-        "deleted_reason": m.get("deleted_reason"), "restored_from": m.get("restored_from"),
-        "supersedes": rec["supersedes"], "topics": sorted(rec["topics"]),
-        "projects": sorted(rec["projects"]), "project_paths": sorted(rec["project_paths"]),
-        "sessions": rec["sessions"],
-    }
+        for k, v in data.items():
+            print(f"{k}: {v if not isinstance(v, (list, dict)) else json.dumps(v)}")
 
-def cmd_get(args):
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            d = _memory_details(session, _resolve_memory(session, args.memory_id))
-    finally:
-        driver.close()
-    if args.json:
-        print(json.dumps(d))
+
+def _secret_from(prompt, env_name):
+    """A secret from the environment, piped stdin, or a hidden prompt — never argv."""
+    if os.environ.get(env_name):
+        return os.environ[env_name].strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().strip()
+    return getpass.getpass(prompt).strip()
+
+
+# --- knowledge commands (run on the server) ---------------------------------------
+
+def knowledge(args):
+    a = vars(args).copy()
+    command = a.pop("command")
+    directory = a.pop("directory", None)
+    space = a.pop("space", None)
+    session = a.pop("session", None)
+    for k in ("as_json", "func"):
+        a.pop(k, None)
+    if command == "save" and a.get("type") not in VALID_TYPES:
+        fail(f"invalid type '{a.get('type')}'", "use one of: " + ", ".join(VALID_TYPES))
+    ctx = client.build_ctx(directory, session, space)
+    if command in ("search", "stats", "links", "get", "session", "visibility", "delete") and not directory:
+        ctx.pop("project_key", None)  # not project-scoped: don't guess one from cwd
+    output, code = client.run(command, a, ctx)
+    if output:
+        print(output)
+    sys.exit(code)
+
+
+# --- connection --------------------------------------------------------------------
+
+def cmd_login(args):
+    server = client.check_server_url(args.url, args.insecure)
+    cfg = client.load_config()
+    if args.invite:
+        code = _secret_from("Invite code: ", "JEJAK_INVITE")
+        token = client.request("POST", "/v1/auth/invite", {"code": code, "token_name": jejak.machine_name()},
+                               auth=False, server=server)["token"]
+    elif args.token_stdin:
+        token = _secret_from("Token: ", "JEJAK_TOKEN")
+    else:
+        if not sys.stdin.isatty():
+            fail("A password login needs a terminal.",
+                 f"Let the user run it: ! jejak login {server}   (or use --invite / --token-stdin)")
+        username = args.username or input("Username: ").strip()
+        password = getpass.getpass("Password: ")
+        token = client.request("POST", "/v1/auth/login",
+                               {"username": username, "password": password,
+                                "token_name": jejak.machine_name()},
+                               auth=False, server=server)["token"]
+    cfg.update({"server": server, "token": token})
+    me = client.request("GET", "/v1/me", cfg=cfg)
+    cfg["accepts_prompts"] = bool(me.get("accepts_prompts"))
+    client.save_config(cfg)
+    print(f"Logged in to {server} as {me['username']} (token saved in {client.CONFIG}, chmod 600).")
+    print(f"Default space: {me['default_space']}. Spaces: "
+          + ", ".join(f"{s['slug']} ({s['role']})" for s in me["spaces"]))
+
+
+def cmd_logout(args):
+    cfg = client.load_config()
+    if cfg.get("token"):
+        try:
+            client.request("POST", "/v1/auth/logout", {}, cfg=cfg, timeout=5)
+        except client.ClientError:
+            pass
+    cfg.pop("token", None)
+    client.save_config(cfg)
+    print("Logged out; the token was revoked on the server and removed here.")
+
+
+def cmd_whoami(args):
+    me = client.request("GET", "/v1/me")
+    if args.as_json:
+        emit(me, True)
         return
-    print(f"=== {d['memory_id']} ===")
-    print(f"    [{d['type']}] {d['status'].upper()}  score:{d['relevance_score'] or 0:.0f}  "
-          f"hits:{d['hit_count'] or 0}  sessions:{d['sessions']}")
-    print(f"    created:{str(d['created_at'])[:19]}  updated:{str(d['updated_at'])[:19]}  machine:{d['machine_name']}")
-    print(f"    visibility:{d['visibility']}")
-    print(f"    projects:{', '.join(d['projects'])}  topics:{', '.join(d['topics'])}")
-    if d["source_file"]:
-        print(f"    file:{d['source_file']}")
-    if d["status"] == "superseded":
-        print(f"    superseded by {d['superseded_by'][:8]} at {str(d['superseded_at'])[:19]}")
-    if d["status"] == "deleted":
-        print(f"    deleted at {str(d['superseded_at'])[:19]}: {d['deleted_reason'] or '(no reason)'}")
-    if d["supersedes"]:
-        print(f"    supersedes: {', '.join(i[:8] for i in d['supersedes'])}")
-    if d["restored_from"]:
-        print(f"    restored from: {d['restored_from'][:8]}")
-    print()
-    print(d["content"])
+    print(f"{me['username']}{' (server admin)' if me['server_admin'] else ''} "
+          f"on {client.load_config().get('server')}")
+    print(f"Default space: {me['default_space']}")
+    for s in me["spaces"]:
+        flags = ", public graph" if s["public_graph"] else ""
+        print(f"  {s['slug']:24s} {s['role']}{flags}")
 
-def cmd_delete(args):
-    """Soft delete. Marks the memory superseded by 'deleted', which every active
-    view already hides and jejak-sync carries monotonically to other machines.
-    Nothing is removed from Neo4j; `restore` brings the content back."""
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            memory_id = _resolve_memory(session, args.memory_id)
-            d = _memory_details(session, memory_id)
-            if d["status"] != "active":
-                print(f"Not deleted: {memory_id[:8]} is already {d['status']}.")
-                sys.exit(1)
-            session.run("""
-                MATCH (m:Memory {memory_id: $id})
-                SET m.superseded = true, m.superseded_at = datetime(),
-                    m.superseded_by = 'deleted', m.deleted_reason = $reason,
-                    m.updated_at = datetime()
-            """, id=memory_id, reason=jejak.redact(args.reason or ""))
-    finally:
-        driver.close()
-    print(f"Deleted [{d['type']}] id:{memory_id[:8]} (soft; restore with: jejak restore {memory_id[:8]})")
 
-def cmd_restore(args):
-    """Bring a deleted memory back as a NEW active entry (restored_from = old id).
-    Un-setting `superseded` in place would be undone by the next sync, because
-    jejak-sync treats superseded as monotonic."""
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            old_id = _resolve_memory(session, args.memory_id)
-            d = _memory_details(session, old_id)
-    finally:
-        driver.close()
-    if d["status"] == "active":
-        print(f"Nothing to restore: {old_id[:8]} is active.")
-        sys.exit(1)
-    if d["status"] == "superseded":
-        print(f"{old_id[:8]} was superseded by {d['superseded_by'][:8]}, not deleted. To make it current again, "
-              f"save its content with --supersedes {d['superseded_by'][:8]} so only one version stays active.")
-        sys.exit(1)
-    directory = args.directory or (d["project_paths"][0] if d["project_paths"] else os.getcwd())
-    cmd_save(argparse.Namespace(type=d["type"], content=[d["content"]], directory=directory,
-                                session=args.session, file=d["source_file"], supersedes=None,
-                                visibility=d["visibility"]))
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            session.run("""
-                MATCH (m:Memory) WHERE m.content = $content AND m.memory_id <> $old
-                  AND coalesce(m.superseded, false) = false
-                SET m.restored_from = $old
-            """, content=jejak.redact(d["content"]), old=old_id)
-    finally:
-        driver.close()
+def cmd_status(args):
+    """One look at everything an agent needs to know before using Jejak."""
+    cfg = client.load_config()
+    st = {"server": cfg.get("server"), "logged_in": bool(cfg.get("token")), "reachable": False,
+          "user": None, "space_here": None, "project_here": None,
+          "queued_offline": len(client.outbox_items())}
+    key, _ = jejak.project_identity(os.getcwd())
+    st["project_here"] = key
+    hint = None
+    if not st["server"]:
+        hint = "jejak login <server-url>"
+    else:
+        try:
+            client.request("GET", "/healthz", auth=False, timeout=5)
+            st["reachable"] = True
+            if st["logged_in"]:
+                me = client.request("GET", "/v1/me", timeout=5)
+                st["user"] = me["username"]
+                st["space_here"] = client.space_for(os.getcwd(), cfg) or me["default_space"]
+                role = {s["slug"]: s["role"] for s in me["spaces"]}.get(st["space_here"])
+                st["role_here"] = role or "not a member"
+                if not role:
+                    hint = "jejak space list, then: jejak space use <slug>"
+                elif role == "viewer":
+                    hint = "You can read here but not save. Ask an owner for editor."
+                if st["queued_offline"]:
+                    st["sent_from_queue"] = client.flush_outbox()
+                    st["queued_offline"] = len(client.outbox_items())
+            else:
+                hint = f"jejak login {st['server']}"
+        except client.ClientError as e:
+            hint = e.hint or str(e)
+    st["ok"] = bool(st["reachable"] and st["user"] and hint is None)
+    if hint:
+        st["hint"] = hint
+    emit(st, args.as_json)
+    sys.exit(0 if st["ok"] else 1)
 
-def _set_visibility(session, memory_id, visibility):
-    """Bumps updated_at so jejak-sync carries the change to other machines."""
-    session.run("""
-        MATCH (m:Memory {memory_id: $id})
-        SET m.visibility = $visibility, m.updated_at = datetime()
-    """, id=memory_id, visibility=visibility)
 
-def cmd_visibility(args):
-    """Mark memories public or confidential. Only public ones show in full in a
-    public graph view; this changes no content, so it is set in place."""
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            ids = [_resolve_memory(session, p) for p in args.memory_ids]
-            for memory_id in ids:
-                d = _memory_details(session, memory_id)
-                if d["type"] == "prompt" and args.visibility == "public":
-                    print(f"Skipped {memory_id[:8]}: prompts always stay confidential.")
-                    continue
-                _set_visibility(session, memory_id, args.visibility)
-                print(f"{memory_id[:8]} [{d['type']}] {d['visibility']} -> {args.visibility}")
-    finally:
-        driver.close()
+def cmd_password(args):
+    if not sys.stdin.isatty():
+        fail("Changing a password needs a terminal.", "Let the user run: ! jejak password")
+    old = getpass.getpass("Current password (empty if you never set one): ")
+    new = getpass.getpass("New password (10+ characters): ")
+    if new != getpass.getpass("Again: "):
+        fail("The new passwords differ.")
+    client.request("POST", "/v1/auth/password", {"old_password": old, "new_password": new})
+    print("Password changed.")
+
+
+# --- spaces, tokens, users -------------------------------------------------------------
+
+def cmd_space(args):
+    op = args.op
+    if op == "list":
+        me = client.request("GET", "/v1/me")
+        emit(me["spaces"], True) if args.as_json else cmd_whoami(args)
+    elif op == "create":
+        emit(client.request("POST", "/v1/spaces", {"slug": args.slug, "name": args.title}), args.as_json)
+    elif op == "use":
+        directory = os.path.realpath(os.path.abspath(args.directory or os.getcwd()))
+        me = client.request("GET", "/v1/me")
+        if args.slug not in {s["slug"] for s in me["spaces"]}:
+            fail(f"You are not a member of '{args.slug}'.", "jejak space list")
+        cfg = client.load_config()
+        cfg.setdefault("spaces", {})[directory] = args.slug
+        client.save_config(cfg)
+        print(f"Knowledge saved under {directory} now goes to space '{args.slug}'.")
+    elif op == "members":
+        emit(client.request("GET", f"/v1/spaces/{args.slug}/members"), True)
+    elif op == "add-member":
+        emit(client.request("PUT", f"/v1/spaces/{args.slug}/members/{args.username}", {"role": args.role}),
+             args.as_json)
+    elif op == "remove-member":
+        emit(client.request("DELETE", f"/v1/spaces/{args.slug}/members/{args.username}"), args.as_json)
+    elif op == "public":
+        r = client.request("PATCH", f"/v1/spaces/{args.slug}", {"public_graph": args.state == "on"})
+        url = client.load_config().get("server", "") + f"/s/{args.slug}"
+        print(f"Public graph for {args.slug}: {args.state}." + (f" Anyone can open {url} "
+              "(only entries marked public show their text)." if r.get("public_graph") else ""))
+
+
+def cmd_token(args):
+    if args.op == "list":
+        emit(client.request("GET", "/v1/tokens")["tokens"], True)
+    elif args.op == "create":
+        if not args.file:
+            fail("Tokens are written to a file, never printed.",
+                 f"jejak token create {args.name} --file ~/.jejak/{args.name}.token")
+        token = client.request("POST", "/v1/tokens", {"name": args.name, "days": args.days})["token"]
+        path = os.path.expanduser(args.file)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+        os.chmod(path, 0o600)
+        print(f"Token '{args.name}' written to {path} (chmod 600). Use it as "
+              "'Authorization: Bearer <token>' for MCP clients; revoke with: jejak token revoke <id>")
+    elif args.op == "revoke":
+        emit(client.request("DELETE", f"/v1/tokens/{args.name}"), args.as_json)
+
+
+def cmd_user(args):
+    op = args.op
+    if op == "list":
+        emit(client.request("GET", "/v1/users")["users"], True)
+    elif op == "create":
+        r = client.request("POST", "/v1/users", {"username": args.name, "server_admin": args.admin,
+                                                  "space": args.space, "role": args.role, "hours": args.hours})
+        print(f"Created {r['username']}. Single-use invite code (valid {args.hours} h): {r['invite']}")
+        print(f"They run: jejak login {client.load_config().get('server')} --invite   and paste the code.")
+    elif op == "invite":
+        r = client.request("POST", f"/v1/users/{args.name}/invite", {"hours": args.hours})
+        print(f"Single-use invite code for {args.name} (valid {args.hours} h): {r['invite']}")
+    elif op in ("disable", "enable"):
+        emit(client.request("POST", f"/v1/users/{args.name}/{op}"), args.as_json)
+
+
+# --- parser ----------------------------------------------------------------------------------
+
+def parser():
+    p = argparse.ArgumentParser(prog="jejak", description="Jejak CLI (client of a Jejak server)")
+    p.add_argument("--json", dest="as_json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="command")
+
+    def k(name, **kw):
+        sp = sub.add_parser(name, **kw)
+        sp.set_defaults(func=knowledge)
+        return sp
+
+    s = k("save", help="Save a knowledge entry")
+    s.add_argument("type")
+    s.add_argument("content", nargs="+")
+    s.add_argument("-d", "--directory")
+    s.add_argument("-s", "--session")
+    s.add_argument("-f", "--file")
+    s.add_argument("--supersedes")
+    s.add_argument("--visibility", choices=jejak.VISIBILITIES)
+    s.add_argument("--space", help="space to save to (default: this directory's space)")
+    m = k("map", help="Knowledge map for a project")
+    m.add_argument("directory", nargs="?")
+    se = k("session", help="All knowledge from a session")
+    se.add_argument("session_id")
+    se.add_argument("--json", action="store_true")
+    q = k("search", help="Search across all your spaces")
+    q.add_argument("query", nargs="+")
+    t = k("topics", help="Topic clusters for a project")
+    t.add_argument("directory", nargs="?")
+    k("stats", help="Counts across your spaces")
+    r = k("rank", help="Knowledge ranked by relevance")
+    r.add_argument("directory", nargs="?")
+    r.add_argument("-a", "--all", action="store_true")
+    li = k("links", help="Connections of one memory")
+    li.add_argument("memory_id")
+    dup = k("check-duplicates", help="Existing knowledge to compare before saving")
+    dup.add_argument("content", nargs="+")
+    dup.add_argument("-d", "--directory")
+    ex = k("export", help="Export as Markdown")
+    ex.add_argument("directory", nargs="?")
+    ex.add_argument("-a", "--all", action="store_true")
+    ask = k("ask", help="Answer a question from Jejak")
+    ask.add_argument("question", nargs="+")
+    ask.add_argument("-d", "--directory")
+    g = k("get", help="One memory in full")
+    g.add_argument("memory_id")
+    g.add_argument("--json", action="store_true")
+    de = k("delete", help="Soft-delete a memory")
+    de.add_argument("memory_id")
+    de.add_argument("-r", "--reason")
+    v = k("visibility", help="Mark memories public or confidential")
+    v.add_argument("visibility", choices=jejak.VISIBILITIES)
+    v.add_argument("memory_ids", nargs="+")
+    rs = k("restore", help="Bring a deleted memory back")
+    rs.add_argument("memory_id")
+    rs.add_argument("-d", "--directory")
+    rs.add_argument("-s", "--session")
+
+    lg = sub.add_parser("login", help="Connect this machine to a Jejak server")
+    lg.add_argument("url")
+    lg.add_argument("-u", "--username")
+    lg.add_argument("--invite", action="store_true", help="redeem a single-use invite code (stdin or JEJAK_INVITE)")
+    lg.add_argument("--token-stdin", action="store_true", help="use an existing token (stdin or JEJAK_TOKEN)")
+    lg.add_argument("--insecure", action="store_true", help="allow http:// to another machine (not recommended)")
+    lg.set_defaults(func=cmd_login)
+    sub.add_parser("logout").set_defaults(func=cmd_logout)
+    sub.add_parser("whoami").set_defaults(func=cmd_whoami)
+    sub.add_parser("status", help="Is Jejak ready here? (server, login, space, offline queue)").set_defaults(func=cmd_status)
+    sub.add_parser("password", help="Change your password (interactive)").set_defaults(func=cmd_password)
+
+    sp = sub.add_parser("space", help="Spaces and members")
+    sp.set_defaults(func=cmd_space)
+    ssub = sp.add_subparsers(dest="op", required=True)
+    ssub.add_parser("list")
+    c = ssub.add_parser("create")
+    c.add_argument("slug")
+    c.add_argument("--title")
+    u = ssub.add_parser("use", help="send saves from a directory to a space")
+    u.add_argument("slug")
+    u.add_argument("directory", nargs="?")
+    mm = ssub.add_parser("members")
+    mm.add_argument("slug")
+    am = ssub.add_parser("add-member")
+    am.add_argument("slug")
+    am.add_argument("username")
+    am.add_argument("role", choices=["viewer", "editor", "owner"])
+    rm = ssub.add_parser("remove-member")
+    rm.add_argument("slug")
+    rm.add_argument("username")
+    pb = ssub.add_parser("public")
+    pb.add_argument("slug")
+    pb.add_argument("state", choices=["on", "off"])
+
+    tk = sub.add_parser("token", help="Tokens for MCP clients and other machines")
+    tk.set_defaults(func=cmd_token)
+    tk.add_argument("op", choices=["list", "create", "revoke"])
+    tk.add_argument("name", nargs="?", default="token", help="name (create) or id (revoke)")
+    tk.add_argument("--days", type=int)
+    tk.add_argument("--file")
+
+    us = sub.add_parser("user", help="Users (server admins)")
+    us.set_defaults(func=cmd_user)
+    us.add_argument("op", choices=["list", "create", "invite", "disable", "enable"])
+    us.add_argument("name", nargs="?")
+    us.add_argument("--space")
+    us.add_argument("--role", default="viewer", choices=["viewer", "editor", "owner"])
+    us.add_argument("--admin", action="store_true")
+    us.add_argument("--hours", type=int, default=24)
+    return p
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Jejak CLI")
-    subparsers = parser.add_subparsers(dest="command")
-
-    save_p = subparsers.add_parser("save", help="Save a knowledge entry")
-    save_p.add_argument("type", choices=VALID_TYPES)
-    save_p.add_argument("content", nargs="+")
-    save_p.add_argument("-d", "--directory", help="Project directory (default: cwd)")
-    save_p.add_argument("-s", "--session", help="Session ID (default: from env or 'manual')")
-    save_p.add_argument("-f", "--file", help="Source file path related to this knowledge")
-    save_p.add_argument("--supersedes", help="8-char id of an existing memory this one replaces (conflict prune)")
-    save_p.add_argument("--visibility", choices=jejak.VISIBILITIES,
-                        help="public = may be shown in a public graph view (default: confidential)")
-
-    map_p = subparsers.add_parser("map", help="Show knowledge map for a directory")
-    map_p.add_argument("directory", nargs="?", help="Directory (default: cwd)")
-
-    sess_p = subparsers.add_parser("session", help="Show all knowledge from a session")
-    sess_p.add_argument("session_id")
-    sess_p.add_argument("--json", action="store_true", help="Output as JSON (machine-readable, e.g. for Seamux)")
-
-    search_p = subparsers.add_parser("search", help="Search across all knowledge")
-    search_p.add_argument("query", nargs="+")
-
-    topics_p = subparsers.add_parser("topics", help="Show topic clusters")
-    topics_p.add_argument("directory", nargs="?")
-
-    subparsers.add_parser("stats", help="Show global stats")
-
-    rank_p = subparsers.add_parser("rank", help="Show knowledge ranked by relevance score")
-    rank_p.add_argument("directory", nargs="?", help="Project directory (default: cwd)")
-    rank_p.add_argument("-a", "--all", action="store_true", help="Show all projects, not just current")
-
-    links_p = subparsers.add_parser("links", help="Show all connections for a memory")
-    links_p.add_argument("memory_id", help="Memory ID (full or prefix)")
-
-    dup_p = subparsers.add_parser("check-duplicates", help="Check for duplicates and conflicts")
-    dup_p.add_argument("content", nargs="+")
-    dup_p.add_argument("-d", "--directory", help="Project directory (default: cwd)")
-
-    export_p = subparsers.add_parser("export", help="Export knowledge as Markdown")
-    export_p.add_argument("directory", nargs="?", help="Project directory (default: cwd)")
-    export_p.add_argument("-a", "--all", action="store_true", help="Export all projects")
-
-    ask_p = subparsers.add_parser("ask", help="Answer a question from Jejak")
-    ask_p.add_argument("question", nargs="+")
-    ask_p.add_argument("-d", "--directory", help="Project directory (default: cwd)")
-
-    get_p = subparsers.add_parser("get", help="Show one memory in full (any status)")
-    get_p.add_argument("memory_id", help="Memory ID (full or prefix)")
-    get_p.add_argument("--json", action="store_true", help="Output as JSON")
-
-    del_p = subparsers.add_parser("delete", help="Soft-delete a memory (reversible with restore)")
-    del_p.add_argument("memory_id", help="Memory ID (full or prefix)")
-    del_p.add_argument("-r", "--reason", help="Why it is being deleted")
-
-    vis_p = subparsers.add_parser("visibility", help="Mark memories public or confidential")
-    vis_p.add_argument("visibility", choices=jejak.VISIBILITIES)
-    vis_p.add_argument("memory_ids", nargs="+", help="Memory IDs (full or prefix)")
-
-    res_p = subparsers.add_parser("restore", help="Bring a deleted memory back as a new active entry")
-    res_p.add_argument("memory_id", help="Memory ID (full or prefix)")
-    res_p.add_argument("-d", "--directory", help="Project directory (default: the memory's own project)")
-    res_p.add_argument("-s", "--session", help="Session ID (default: from env or 'manual')")
-
-    args = parser.parse_args()
+    p = parser()
+    args = p.parse_args()
     if not args.command:
-        parser.print_help()
+        p.print_help()
         sys.exit(1)
+    try:
+        args.func(args)
+    except client.ClientError as e:
+        fail(str(e), e.hint)
 
-    commands = {
-        "save": cmd_save,
-        "map": cmd_map,
-        "session": cmd_session,
-        "search": cmd_search,
-        "topics": cmd_topics,
-        "stats": cmd_stats,
-        "rank": cmd_rank,
-        "links": cmd_links,
-        "check-duplicates": cmd_check_duplicates,
-        "export": cmd_export,
-        "ask": cmd_ask,
-        "get": cmd_get,
-        "delete": cmd_delete,
-        "restore": cmd_restore,
-        "visibility": cmd_visibility,
-    }
-    commands[args.command](args)
 
-main()
+if __name__ == "__main__":
+    main()

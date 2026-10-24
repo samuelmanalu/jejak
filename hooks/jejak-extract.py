@@ -22,7 +22,7 @@ import os
 import sys
 import subprocess
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jejak_common as jejak
 
 HOOKS_DIR = os.path.expanduser("~/.claude/hooks")
@@ -110,22 +110,10 @@ def extract_last_exchange(transcript_path):
 
 
 def fetch_existing_knowledge(cwd, limit=40):
-    """Active (non-superseded) project knowledge, as a list of (id8, type, content)."""
-    from neo4j import GraphDatabase
-    cfg = jejak.load_config("neo4j")
-    driver = GraphDatabase.driver(cfg["uri"], auth=(cfg["user"], cfg["password"]))
-    try:
-        with driver.session() as s:
-            rows = s.run("""
-                MATCH (m:Memory)-[:IN_PROJECT]->(p:Project {path: $path})
-                WHERE m.type <> 'prompt' AND m.type <> 'session_summary'
-                  AND coalesce(m.superseded, false) = false
-                RETURN left(m.memory_id, 8) AS id, m.type AS type, m.content AS content
-                ORDER BY m.relevance_score DESC LIMIT $limit
-            """, path=cwd, limit=limit)
-            return [(r["id"], r["type"], r["content"]) for r in rows]
-    finally:
-        driver.close()
+    """Active project knowledge from the Jejak server, as a list of (id8, type, content)."""
+    import jejak_client as client
+    out, code = client.run("recent", {"limit": limit}, client.build_ctx(cwd), timeout=10)
+    return [tuple(r) for r in json.loads(out)] if code == 0 and out else []
 
 
 def judge_and_categorize(exchange_text, existing):

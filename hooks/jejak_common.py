@@ -48,6 +48,7 @@ _REDACTIONS = [
     # provider-style keys
     (re.compile(r'\bsk-[A-Za-z0-9]{16,}\b'), lambda m: "[REDACTED_KEY]"),
     (re.compile(r'\bghp_[A-Za-z0-9]{20,}\b'), lambda m: "[REDACTED_KEY]"),
+    (re.compile(r'\bjj[ki]_[A-Za-z0-9_-]{20,}'), lambda m: "[REDACTED_JEJAK_TOKEN]"),
     (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), lambda m: "[REDACTED_KEY]"),
     (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'), lambda m: "[REDACTED_KEY]"),
     # connection strings user:pass@host
@@ -104,6 +105,33 @@ def extract_project_name(cwd):
         if part and part not in skip:
             return part
     return parts[-1] if parts else "unknown"
+
+def project_identity(cwd):
+    """(key, name) of the project at `cwd`, the same for every teammate.
+
+    key is the normalized git remote ("github.com/org/repo") when the directory
+    is a git checkout with an origin, otherwise the directory's project name.
+    Absolute paths differ per person, so they are never the key."""
+    name = extract_project_name(cwd or "")
+    try:
+        url = subprocess.run(["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError, TypeError):
+        url = ""
+    key = normalize_remote(url) if url else ""
+    if key:
+        return key, key.rsplit("/", 1)[-1]
+    return name, name
+
+def normalize_remote(url):
+    """git@github.com:Org/Repo.git, https://user@github.com/Org/Repo -> github.com/org/repo"""
+    u = url.strip()
+    u = re.sub(r"^[a-z+]+://", "", u)          # scheme
+    u = re.sub(r"^[^@/]+@", "", u)              # user@ (and any credentials)
+    u = re.sub(r":(?!\d+/)", "/", u, count=1)  # scp-style host:path (not host:port/)
+    u = re.sub(r"^([^/]+):\d+/", r"\1/", u)     # drop a port
+    u = re.sub(r"\.git/?$", "", u).strip("/")
+    return u.lower()
 
 def machine_name():
     # On macOS with no HostName set, gethostname() is whatever the current

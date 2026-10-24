@@ -6,9 +6,9 @@
 Jejak MCP server — the knowledge graph for any MCP client (Gemini CLI,
 Antigravity, Cursor, Claude, ...), with full create/read/update/delete.
 
-Every tool shells out to jejak-cli.py, the single interface to Jejak. Nothing
-here talks to Neo4j directly, so redaction, exact-content dedup, scoring,
-superseding and the soft-delete rules stay in ONE place.
+Every tool shells out to jejak-cli.py, which sends it to the Jejak server
+this machine is logged in to (`jejak login`). For clients that speak MCP over
+HTTP, skip this bridge and connect straight to <server>/mcp with a token.
 
 Run:       uv run --script ~/.claude/hooks/jejak-mcp.py
 Env:
@@ -16,11 +16,10 @@ Env:
                      session id "<client>-<YYYY-MM-DD>" on saves. Default "mcp".
   JEJAK_DEFAULT_DIR  project directory when a tool call gives none
                      (default: the server's working directory).
-  JEJAK_PYTHON       interpreter that has the neo4j driver (default: the first
-                     of /usr/bin/python3, python3 that imports neo4j).
+  JEJAK_PYTHON       interpreter for the CLI (default: this one; stdlib only).
 """
 import os
-import shutil
+import sys
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -55,14 +54,8 @@ mcp = FastMCP("jejak", instructions=INSTRUCTIONS)
 
 
 def _python():
-    explicit = os.environ.get("JEJAK_PYTHON")
-    if explicit:
-        return explicit
-    for cand in ("/usr/bin/python3", shutil.which("python3")):
-        if cand and subprocess.run([cand, "-c", "import neo4j"],
-                                   capture_output=True).returncode == 0:
-            return cand
-    return "python3"
+    # The CLI is standard-library only, so any python3 will do.
+    return os.environ.get("JEJAK_PYTHON") or sys.executable or "python3"
 
 
 PYTHON = _python()
@@ -85,8 +78,8 @@ def _cli(*args, timeout=120):
         return f"jejak timed out after {timeout}s"
     out = (r.stdout or "").strip()
     if r.returncode != 0:
-        err = (r.stderr or "").strip().splitlines()
-        out = f"{out}\n[error] {err[-1] if err else f'exit {r.returncode}'}".strip()
+        err = (r.stderr or "").strip()
+        out = f"{out}\n[error] {err or f'exit {r.returncode}'}".strip()
     if len(out) > MAX_OUTPUT:
         out = out[:MAX_OUTPUT] + f"\n… truncated ({len(out)} chars)"
     return out or "(no output)"

@@ -27,7 +27,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HOST = "127.0.0.1"
 PORT = 8787
