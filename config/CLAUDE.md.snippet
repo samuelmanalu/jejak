@@ -74,6 +74,13 @@ Escalation order — stop as soon as you have the answer:
 If the graph answers it, do not re-derive it from the codebase. If the graph is wrong,
 correct it with `--supersedes` as part of answering.
 
+## VISIBILITY — confidential unless safe for anyone to read
+Every entry is `confidential` by default; only `public` entries show in full in a
+public graph view. Add `--visibility public` (or run `jejak visibility public <id>`)
+only for knowledge you would put in a public blog post: design, features, front-end
+fixes. Never for employer work, server addresses or config, security setup, access
+keys, costs, or people's personal details.
+
 ## What NOT to save
 - Trivial file reads with no insight
 - Commands that produced no useful output

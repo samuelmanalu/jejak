@@ -72,6 +72,7 @@ def save_memory(driver, memory_type, content, topics, project_path, project_name
         session.run("""
             CREATE (m:Memory {memory_id: $memory_id, type: $type, content: $content,
                 machine_name: $machine_name, hit_count: 1, relevance_score: 0.0,
+                visibility: 'confidential',
                 last_accessed_at: datetime(), created_at: datetime(), updated_at: datetime()})
         """, memory_id=memory_id, type=memory_type, content=content, machine_name=machine_name)
 
@@ -331,7 +332,8 @@ def handle_session_end(data):
                 session.run("""
                     CREATE (m:Memory {memory_id: $id, type: 'session_summary', content: $content,
                         machine_name: $machine, hit_count: 1, relevance_score: 0.0,
-                        last_accessed_at: datetime(), created_at: datetime(), updated_at: datetime()})
+                        visibility: 'confidential',
+                last_accessed_at: datetime(), created_at: datetime(), updated_at: datetime()})
                 """, id=summary_id, content=summary_text, machine=jejak.machine_name())
                 session.run("""
                     MATCH (m:Memory {memory_id: $id})

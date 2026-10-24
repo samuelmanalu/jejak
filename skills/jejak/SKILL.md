@@ -28,7 +28,13 @@ Save, search, map, rank, and browse linked knowledge stored in Neo4j. Knowledge 
 /jejak get <memory_id> [--json]     Show one memory in full, any status
 /jejak delete <memory_id> -r <why>  Soft-delete (hidden everywhere, kept for audit)
 /jejak restore <memory_id>          Bring a deleted memory back as a new entry
+/jejak visibility <public|confidential> <id>...   Who may read it in a public graph view
 ```
+
+Every memory is `confidential` unless marked `public` (`save ... --visibility public`
+or `visibility public <id>`). A public graph view (`serve-graph.py --public`) shows
+confidential memories only as anonymous nodes. Mark public only what is safe for
+anyone to read; prompts always stay confidential.
 
 `delete` is for entries that are plainly wrong or that the user wants gone; to
 correct an entry, use `save ... --supersedes` instead. Same CLI:

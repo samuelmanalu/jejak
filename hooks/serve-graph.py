@@ -14,7 +14,14 @@ EDGES_PER_NODE links (by shared-topic strength, then the neighbour's score).
 Topic linking makes the stored graph nearly complete (1.9M links for 6k
 memories), which no browser can draw. All links stay in Neo4j for ranking,
 `links` and `ask`.
+
+PUBLIC MODE (--public) is for a graph view other people can open: every node
+and link is still there, but a memory that is not marked public is sent as an
+anonymous node (id, type and size only; no content, topics, projects or
+sessions). The redaction happens in the Cypher query, so confidential text
+never leaves Neo4j. Mark memories with `jejak visibility public <id>`.
 """
+import argparse
 import http.server
 import json
 import os
@@ -24,6 +31,7 @@ sys.path.insert(0, os.path.expanduser("~/.claude/hooks"))
 
 HOST = "127.0.0.1"
 PORT = 8787
+PUBLIC = False  # set by --public
 HTML_PATH = os.path.expanduser("~/.claude/hooks/jejak.html")
 EDGES_PER_NODE = int(os.environ.get("JEJAK_GRAPH_EDGES_PER_NODE", "10"))
 
@@ -34,7 +42,30 @@ SIGNATURE_QUERY = """
     RETURN count(m) AS n, toString(max(m.updated_at)) AS updated,
            sum(coalesce(m.hit_count, 1)) AS hits,
            round(sum(coalesce(m.relevance_score, 0.0))) AS score,
-           sum(CASE WHEN coalesce(m.superseded, false) THEN 1 ELSE 0 END) AS inactive
+           sum(CASE WHEN coalesce(m.superseded, false) THEN 1 ELSE 0 END) AS inactive,
+           sum(CASE WHEN coalesce(m.visibility, 'confidential') = 'public' THEN 1 ELSE 0 END) AS public
+"""
+
+NODES_QUERY = """
+    MATCH (m:Memory)
+    WHERE coalesce(m.superseded, false) = false
+    OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
+    OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
+    OPTIONAL MATCH (m)-[:IN_SESSION]->(sess:Session)
+    WITH m, collect(DISTINCT t.name) AS topics,
+         collect(DISTINCT p.name) AS projects,
+         collect(DISTINCT sess.session_id) AS sessions,
+         coalesce(m.visibility, 'confidential') = 'public' AS public
+    WITH m, topics, projects, sessions, public,
+         public OR NOT $public_view AS shown
+    RETURN left(m.memory_id, 8) AS id, m.type AS type,
+           CASE WHEN shown THEN m.content ELSE '' END AS content,
+           coalesce(m.hit_count, 1) AS hits,
+           coalesce(m.relevance_score, 0.0) AS score,
+           CASE WHEN shown THEN topics ELSE [] END AS topics,
+           CASE WHEN shown THEN projects ELSE [] END AS projects,
+           CASE WHEN shown THEN [x IN sessions | left(x, 8)] ELSE [] END AS sessions,
+           public, NOT shown AS confidential
 """
 
 EDGES_QUERY = """
@@ -61,28 +92,14 @@ def live_graph():
             signature = tuple(s.run(SIGNATURE_QUERY).single().values())
             if signature == _cache["signature"]:
                 return _cache["data"]
-            nodes = [dict(r) for r in s.run("""
-                MATCH (m:Memory)
-                WHERE coalesce(m.superseded, false) = false
-                OPTIONAL MATCH (m)-[:ABOUT]->(t:Topic)
-                OPTIONAL MATCH (m)-[:IN_PROJECT]->(p:Project)
-                OPTIONAL MATCH (m)-[:IN_SESSION]->(sess:Session)
-                WITH m, collect(DISTINCT t.name) AS topics,
-                     collect(DISTINCT p.name) AS projects,
-                     collect(DISTINCT sess.session_id) AS sessions
-                RETURN left(m.memory_id, 8) AS id, m.type AS type, m.content AS content,
-                       coalesce(m.hit_count, 1) AS hits,
-                       coalesce(m.relevance_score, 0.0) AS score,
-                       topics, projects,
-                       [x IN sessions | left(x, 8)] AS sessions
-            """)]
+            nodes = [dict(r) for r in s.run(NODES_QUERY, public_view=PUBLIC)]
             # Each memory's top-k, merged: a link chosen from both ends is sent once.
             strongest = {}
             for r in s.run(EDGES_QUERY, k=EDGES_PER_NODE):
                 pair = (r["source"], r["target"]) if r["source"] < r["target"] else (r["target"], r["source"])
                 strongest[pair] = max(strongest.get(pair, 0), r["strength"])
             edges = [{"source": a, "target": b, "strength": st} for (a, b), st in strongest.items()]
-        data = {"nodes": nodes, "edges": edges}
+        data = {"nodes": nodes, "edges": edges, "public_view": PUBLIC}
         _cache["signature"], _cache["data"] = signature, data
         return data
     finally:
@@ -124,6 +141,13 @@ class SingleFileHandler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer((HOST, PORT), SingleFileHandler)
-    print(f"Jejak served at http://{HOST}:{PORT}/  (loopback only)")
+    ap = argparse.ArgumentParser(description="Serve the Jejak graph view on loopback.")
+    ap.add_argument("--public", action="store_true",
+                    help="show only memories marked public; others become anonymous nodes")
+    ap.add_argument("--port", type=int, default=PORT)
+    opts = ap.parse_args()
+    PUBLIC = opts.public
+    server = http.server.HTTPServer((HOST, opts.port), SingleFileHandler)
+    mode = "PUBLIC view: confidential memories redacted" if PUBLIC else "private view: everything"
+    print(f"Jejak served at http://{HOST}:{opts.port}/  (loopback only, {mode})")
     server.serve_forever()

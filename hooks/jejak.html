@@ -555,11 +555,13 @@
     const visEdges = getVisibleEdges();
     const projects = new Set(vis.flatMap(n => n.projects));
     const topics = new Set(vis.flatMap(n => n.topics));
+    const publicCount = vis.filter(n => n.public).length;
     statsBar.innerHTML =
       `<span><span class="stat-val">${vis.length}</span> nodes</span>` +
       `<span><span class="stat-val">${visEdges.length}</span> edges</span>` +
       `<span><span class="stat-val">${projects.size}</span> projects</span>` +
-      `<span><span class="stat-val">${topics.size}</span> topics</span>`;
+      `<span><span class="stat-val">${topics.size}</span> topics</span>` +
+      `<span><span class="stat-val">${publicCount}</span> public</span>`;
   }
 
   // ===== FILTERS =====
@@ -992,7 +994,8 @@
       ctx.beginPath();
       ctx.arc(sx, sy, r, 0, Math.PI * 2);
       ctx.fillStyle = col;
-      ctx.globalAlpha = dimmed ? 0.12 : (selected ? 1 : 0.85);
+      // In a public view, confidential bubbles are drawn faint: present, not readable.
+      ctx.globalAlpha = dimmed ? 0.12 : (selected ? 1 : (n.confidential ? 0.3 : 0.85));
       ctx.fill();
       ctx.globalAlpha = 1;
 
@@ -1046,15 +1049,23 @@
 
     let html = '';
     html += `<div class="detail-section"><div class="detail-label">ID</div><div class="detail-id">${node.id}</div></div>`;
-    html += `<div class="detail-section"><div class="detail-label">Content</div><div class="detail-content">${escapeHtml(node.content)}</div></div>`;
+    if (node.confidential) {
+      // The server sent no content, topics, projects or sessions for this node.
+      html += `<div class="detail-section"><div class="detail-label">Content</div><div class="detail-content">Confidential. This knowledge exists in the graph, but its details are not public.</div></div>`;
+    } else {
+      html += `<div class="detail-section"><div class="detail-label">Visibility</div><div class="detail-id">${node.public ? 'Public' : 'Confidential'}</div></div>`;
+      html += `<div class="detail-section"><div class="detail-label">Content</div><div class="detail-content">${escapeHtml(node.content)}</div></div>`;
+    }
 
     if (node.hits != null) {
       html += `<div class="detail-section"><div class="detail-label">Hits</div><div class="detail-id">${node.hits}</div></div>`;
     }
 
-    html += `<div class="detail-section"><div class="detail-label">Topics</div><div class="tag-list">${node.topics.map(t => `<span class="tag">${t}</span>`).join('')}</div></div>`;
-    html += `<div class="detail-section"><div class="detail-label">Projects</div><div class="tag-list">${node.projects.map(p => `<span class="tag">${p}</span>`).join('')}</div></div>`;
-    html += `<div class="detail-section"><div class="detail-label">Sessions</div><div class="tag-list">${node.sessions.map(s => `<span class="tag">${s}</span>`).join('')}</div></div>`;
+    if (!node.confidential) {
+      html += `<div class="detail-section"><div class="detail-label">Topics</div><div class="tag-list">${node.topics.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</div></div>`;
+      html += `<div class="detail-section"><div class="detail-label">Projects</div><div class="tag-list">${node.projects.map(p => `<span class="tag">${escapeHtml(p)}</span>`).join('')}</div></div>`;
+      html += `<div class="detail-section"><div class="detail-label">Sessions</div><div class="tag-list">${node.sessions.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')}</div></div>`;
+    }
 
     if (connectedIds.length > 0) {
       html += `<div class="detail-section"><div class="detail-label">Connections (${connectedIds.length})</div>`;
@@ -1096,7 +1107,8 @@
   // ===== TOOLTIP =====
   function showTooltip(node, mx, my) {
     const col = getTypeColor(node.type);
-    tooltip.innerHTML = `${node.id} <span class="tt-type" style="color:${col}">${node.type}</span>`;
+    tooltip.innerHTML = `${node.id} <span class="tt-type" style="color:${col}">${node.type}</span>` +
+      (node.confidential ? ' <span class="tt-type">confidential</span>' : '');
     tooltip.style.left = (mx + 14) + 'px';
     tooltip.style.top = (my - 10) + 'px';
     tooltip.classList.add('visible');
@@ -1292,7 +1304,7 @@
   function signature(data) {
     // Cheap change-detector: node/edge counts + per-node id/hits/score.
     let s = data.nodes.length + ':' + data.edges.length + '|';
-    for (const n of data.nodes) s += n.id + n.hits + Math.round(n.score || 0) + ';';
+    for (const n of data.nodes) s += n.id + n.hits + Math.round(n.score || 0) + (n.public ? 'p' : '') + ';';
     return s;
   }
 

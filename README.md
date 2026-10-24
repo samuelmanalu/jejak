@@ -188,6 +188,7 @@ Claude that the graph is the single interface for knowledge:
 /jejak get <memory_id> [--json]  One memory in full, any status
 /jejak delete <memory_id> -r why Soft-delete (hidden everywhere, kept for audit)
 /jejak restore <memory_id>       Bring a deleted memory back as a new entry
+/jejak visibility public <id>... Mark memories public (default: confidential)
 ```
 
 Link knowledge to code with `-f`:
@@ -256,6 +257,24 @@ is hidden), then stops and is remembered in the browser, so reopening the page s
 the same map instantly. New knowledge appears next to a linked bubble without
 disturbing the rest. A dragged bubble stays where you drop it. Press `L` to lay the
 map out again.
+
+#### Public view: share the map, keep the details
+
+Every memory is `confidential` unless it is marked `public`:
+
+```bash
+jejak save decision "Dark mode is the default" --visibility public   # when saving
+jejak visibility public 3f8b6a70 9c1d2e4f                           # later
+jejak visibility confidential 3f8b6a70                              # take it back
+python3 ~/.claude/hooks/serve-graph.py --public --port 8788         # public view
+```
+
+The public view still draws every memory and link, so the shape of your knowledge
+is visible, but a confidential memory is a faint, anonymous bubble: its content,
+topics, projects and sessions are blanked inside the Neo4j query, so they never
+reach the server process, let alone the browser. Prompts always stay confidential.
+The server binds to loopback; to publish it, put a reverse proxy (with TLS) in
+front of the `--public` instance only, never the private one.
 
 ### Bonus: `/recap`
 

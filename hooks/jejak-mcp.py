@@ -32,6 +32,7 @@ CLI = HERE / "jejak-cli.py"
 MAX_OUTPUT = 60_000
 TYPES = ("decision", "learning", "finding", "issue", "solution",
          "architecture", "convention", "context")
+VISIBILITIES = ("confidential", "public")
 
 INSTRUCTIONS = """Jejak is the user's engineering knowledge graph. Rules:
 - LOOK UP first: for any "why/how" question about a project, call jejak_ask or
@@ -45,6 +46,9 @@ INSTRUCTIONS = """Jejak is the user's engineering knowledge graph. Rules:
   supersedes the old one (the old one stays for audit).
 - DELETE is soft and reversible (jejak_delete / jejak_restore). Only delete
   when the user asks or the entry is plainly wrong.
+- VISIBILITY: entries are confidential by default. Pass visibility="public"
+  only for knowledge anyone may read (e.g. about a public website), never for
+  employer work, server addresses, security setup, credentials or personal data.
 - Never save secrets, trivial file reads, or conversational filler."""
 
 mcp = FastMCP("jejak", instructions=INSTRUCTIONS)
@@ -98,14 +102,19 @@ def jejak_check_duplicates(content: str, directory: str = "") -> str:
 
 
 @mcp.tool()
-def jejak_save(type: str, content: str, directory: str = "", source_file: str = "") -> str:
+def jejak_save(type: str, content: str, directory: str = "", source_file: str = "",
+               visibility: str = "confidential") -> str:
     """Save a new knowledge entry. `type` is one of: decision, learning, finding,
     issue, solution, architecture, convention, context. `directory` is the
-    project's absolute path; `source_file` links it to a file. Secrets are
-    redacted automatically. Run jejak_check_duplicates first."""
+    project's absolute path; `source_file` links it to a file. `visibility` is
+    confidential (default) or public; use public only for knowledge that is
+    safe for anyone to read. Secrets are redacted automatically. Run
+    jejak_check_duplicates first."""
     if type not in TYPES:
         return f"invalid type '{type}'; use one of: {', '.join(TYPES)}"
-    args = ["save", type, content, "-d", _dir(directory)]
+    if visibility not in VISIBILITIES:
+        return f"invalid visibility '{visibility}'; use one of: {', '.join(VISIBILITIES)}"
+    args = ["save", type, content, "-d", _dir(directory), "--visibility", visibility]
     if source_file:
         args += ["-f", source_file]
     return _cli(*args)
@@ -172,11 +181,16 @@ def jejak_stats() -> str:
 # ── update ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def jejak_update(memory_id: str, content: str, directory: str = "", source_file: str = "") -> str:
+def jejak_update(memory_id: str, content: str, directory: str = "", source_file: str = "",
+                 visibility: str = "confidential") -> str:
     """Replace an entry with a corrected version. Saves `content` as a new entry
     of the SAME type that supersedes `memory_id`; the old one stays for audit
-    but leaves active views. Use this instead of saving a contradicting entry."""
+    but leaves active views. Use this instead of saving a contradicting entry.
+    The new version is confidential unless `visibility` is public, because new
+    content is not covered by the old entry's review."""
     import json
+    if visibility not in VISIBILITIES:
+        return f"invalid visibility '{visibility}'; use one of: {', '.join(VISIBILITIES)}"
     raw = _cli("get", memory_id, "--json")
     try:
         old = json.loads(raw)
@@ -185,7 +199,8 @@ def jejak_update(memory_id: str, content: str, directory: str = "", source_file:
     if old["status"] != "active":
         return f"{old['memory_id'][:8]} is {old['status']}; only an active entry can be updated."
     target_dir = directory or (old["project_paths"][0] if old["project_paths"] else _dir(""))
-    args = ["save", old["type"], content, "-d", target_dir, "--supersedes", old["memory_id"][:8]]
+    args = ["save", old["type"], content, "-d", target_dir, "--supersedes", old["memory_id"][:8],
+            "--visibility", visibility]
     file = source_file or old.get("source_file")
     if file:
         args += ["-f", file]
@@ -193,6 +208,18 @@ def jejak_update(memory_id: str, content: str, directory: str = "", source_file:
     if "SUPERSEDES:" not in out:
         out += "\n[warning] the old entry was NOT marked superseded; check with jejak_get."
     return out
+
+
+@mcp.tool()
+def jejak_set_visibility(memory_ids: list[str], visibility: str) -> str:
+    """Mark entries public or confidential. Only public entries show in full in
+    a public graph view; confidential ones appear there as anonymous nodes.
+    Content is unchanged. Prompts always stay confidential."""
+    if visibility not in VISIBILITIES:
+        return f"invalid visibility '{visibility}'; use one of: {', '.join(VISIBILITIES)}"
+    if not memory_ids:
+        return "give at least one memory id"
+    return _cli("visibility", visibility, *memory_ids)
 
 
 # ── delete ─────────────────────────────────────────────────────────────────

@@ -43,6 +43,7 @@ def cmd_save(args):
     session_id = os.environ.get("CLAUDE_SESSION_ID", args.session or "manual")
     source_file = args.file or None
     supersedes = getattr(args, "supersedes", None)
+    visibility = getattr(args, "visibility", None)
 
     if memory_type not in VALID_TYPES:
         print(f"Invalid type '{memory_type}'. Valid types: {', '.join(VALID_TYPES)}")
@@ -92,6 +93,8 @@ def cmd_save(args):
                     "MATCH (m:Memory {memory_id: $mid}) RETURN m.relevance_score AS score", mid=existing_id
                 ).single()
                 score = score_result["score"] if score_result else 0
+                if visibility:
+                    _set_visibility(session, existing_id, visibility)
                 pruned = jejak.mark_superseded(session, supersedes, existing_id) if supersedes else None
                 msg = f"Existing [{memory_type}] id:{existing_id[:8]} score:{score:.0f} project:{project_name}"
                 if pruned:
@@ -103,10 +106,11 @@ def cmd_save(args):
             session.run("""
                 CREATE (m:Memory {memory_id: $memory_id, type: $type, content: $content,
                     machine_name: $machine_name, hit_count: 1, relevance_score: 0.0,
-                    source_file: $source_file, last_accessed_at: datetime(),
+                    source_file: $source_file, visibility: $visibility, last_accessed_at: datetime(),
                     created_at: datetime(), updated_at: datetime()})
             """, memory_id=memory_id, type=memory_type, content=content,
-                machine_name=machine_name, source_file=source_file)
+                machine_name=machine_name, source_file=source_file,
+                visibility=visibility or "confidential")
 
             session.run("""
                 MERGE (p:Project {path: $path}) SET p.name = $name, p.last_seen = datetime()
@@ -155,7 +159,8 @@ def cmd_save(args):
             score = score_result["score"] if score_result else 0
             pruned = jejak.mark_superseded(session, supersedes, memory_id) if supersedes else None
 
-        msg = f"Saved [{memory_type}] id:{memory_id[:8]} score:{score:.0f} topics:{topics} project:{project_name}"
+        msg = (f"Saved [{memory_type}] id:{memory_id[:8]} score:{score:.0f} topics:{topics} "
+               f"project:{project_name} visibility:{visibility or 'confidential'}")
         if pruned:
             msg += f" SUPERSEDES:{pruned['id'][:8]}"
         print(msg)
@@ -704,6 +709,11 @@ def cmd_stats(args):
             print(f"  Projects:  {result['projects']}")
             print(f"  Sessions:  {result['sessions']}")
             print(f"  Topics:    {result['topics']}")
+            vis = session.run(f"""
+                MATCH (m:Memory) WHERE {jejak.NOT_SUPERSEDED}
+                RETURN sum(CASE WHEN {jejak.IS_PUBLIC} THEN 1 ELSE 0 END) AS public, count(m) AS active
+            """).single()
+            print(f"  Public:    {vis['public'] or 0} of {vis['active']} active (the rest are confidential)")
             print()
 
             projects = session.run("""
@@ -772,6 +782,7 @@ def _memory_details(session, memory_id):
         "content": m.get("content"), "source_file": m.get("source_file"),
         "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
         "machine_name": m.get("machine_name"),
+        "visibility": m.get("visibility") or "confidential",
         "relevance_score": m.get("relevance_score"), "hit_count": m.get("hit_count"),
         "superseded_at": m.get("superseded_at"), "superseded_by": m.get("superseded_by"),
         "deleted_reason": m.get("deleted_reason"), "restored_from": m.get("restored_from"),
@@ -794,6 +805,7 @@ def cmd_get(args):
     print(f"    [{d['type']}] {d['status'].upper()}  score:{d['relevance_score'] or 0:.0f}  "
           f"hits:{d['hit_count'] or 0}  sessions:{d['sessions']}")
     print(f"    created:{str(d['created_at'])[:19]}  updated:{str(d['updated_at'])[:19]}  machine:{d['machine_name']}")
+    print(f"    visibility:{d['visibility']}")
     print(f"    projects:{', '.join(d['projects'])}  topics:{', '.join(d['topics'])}")
     if d["source_file"]:
         print(f"    file:{d['source_file']}")
@@ -850,7 +862,8 @@ def cmd_restore(args):
         sys.exit(1)
     directory = args.directory or (d["project_paths"][0] if d["project_paths"] else os.getcwd())
     cmd_save(argparse.Namespace(type=d["type"], content=[d["content"]], directory=directory,
-                                session=args.session, file=d["source_file"], supersedes=None))
+                                session=args.session, file=d["source_file"], supersedes=None,
+                                visibility=d["visibility"]))
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -859,6 +872,30 @@ def cmd_restore(args):
                   AND coalesce(m.superseded, false) = false
                 SET m.restored_from = $old
             """, content=jejak.redact(d["content"]), old=old_id)
+    finally:
+        driver.close()
+
+def _set_visibility(session, memory_id, visibility):
+    """Bumps updated_at so jejak-sync carries the change to other machines."""
+    session.run("""
+        MATCH (m:Memory {memory_id: $id})
+        SET m.visibility = $visibility, m.updated_at = datetime()
+    """, id=memory_id, visibility=visibility)
+
+def cmd_visibility(args):
+    """Mark memories public or confidential. Only public ones show in full in a
+    public graph view; this changes no content, so it is set in place."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            ids = [_resolve_memory(session, p) for p in args.memory_ids]
+            for memory_id in ids:
+                d = _memory_details(session, memory_id)
+                if d["type"] == "prompt" and args.visibility == "public":
+                    print(f"Skipped {memory_id[:8]}: prompts always stay confidential.")
+                    continue
+                _set_visibility(session, memory_id, args.visibility)
+                print(f"{memory_id[:8]} [{d['type']}] {d['visibility']} -> {args.visibility}")
     finally:
         driver.close()
 
@@ -873,6 +910,8 @@ def main():
     save_p.add_argument("-s", "--session", help="Session ID (default: from env or 'manual')")
     save_p.add_argument("-f", "--file", help="Source file path related to this knowledge")
     save_p.add_argument("--supersedes", help="8-char id of an existing memory this one replaces (conflict prune)")
+    save_p.add_argument("--visibility", choices=jejak.VISIBILITIES,
+                        help="public = may be shown in a public graph view (default: confidential)")
 
     map_p = subparsers.add_parser("map", help="Show knowledge map for a directory")
     map_p.add_argument("directory", nargs="?", help="Directory (default: cwd)")
@@ -916,6 +955,10 @@ def main():
     del_p.add_argument("memory_id", help="Memory ID (full or prefix)")
     del_p.add_argument("-r", "--reason", help="Why it is being deleted")
 
+    vis_p = subparsers.add_parser("visibility", help="Mark memories public or confidential")
+    vis_p.add_argument("visibility", choices=jejak.VISIBILITIES)
+    vis_p.add_argument("memory_ids", nargs="+", help="Memory IDs (full or prefix)")
+
     res_p = subparsers.add_parser("restore", help="Bring a deleted memory back as a new active entry")
     res_p.add_argument("memory_id", help="Memory ID (full or prefix)")
     res_p.add_argument("-d", "--directory", help="Project directory (default: the memory's own project)")
@@ -941,6 +984,7 @@ def main():
         "get": cmd_get,
         "delete": cmd_delete,
         "restore": cmd_restore,
+        "visibility": cmd_visibility,
     }
     commands[args.command](args)
 

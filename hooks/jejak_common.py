@@ -179,6 +179,12 @@ def recalculate_all_scores(session):
 # `m` must be the memory variable in the surrounding query.
 NOT_SUPERSEDED = "coalesce(m.superseded, false) = false"
 
+# Visibility decides what a PUBLIC graph view may show. Only "public" is shown
+# in full; a missing value counts as confidential, so nothing becomes visible
+# unless someone marked it public on purpose.
+VISIBILITIES = ("confidential", "public")
+IS_PUBLIC = "coalesce(m.visibility, 'confidential') = 'public'"
+
 def mark_superseded(session, old_id_prefix, new_memory_id):
     """Mark an existing memory as superseded by a newer one (reversible prune).
 
